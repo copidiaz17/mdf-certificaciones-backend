@@ -46,6 +46,7 @@ app.set("trust proxy", 1);
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const allowedOrigins = [
   FRONTEND_URL,
+  "https://mdf-certificaciones-frontend.onrender.com",
   "http://localhost:5173",
   "http://localhost:5174",
 ];
