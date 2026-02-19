@@ -100,6 +100,17 @@ app.use((err, req, res, next) => {
 // ===============================================
 // 6. VALIDACIONES DE ENTORNO (AVISO)
 // ===============================================
+console.log("🔍 Variables de entorno cargadas:");
+console.log("   NODE_ENV:", process.env.NODE_ENV || "(no definido)");
+console.log("   PORT:", process.env.PORT || "(no definido)");
+console.log("   DB_HOST:", process.env.DB_HOST || "(no definido)");
+console.log("   DB_PORT:", process.env.DB_PORT || "(no definido)");
+console.log("   DB_NAME:", process.env.DB_NAME || "(no definido)");
+console.log("   DB_USER:", process.env.DB_USER || "(no definido)");
+console.log("   DB_PASSWORD:", process.env.DB_PASSWORD ? "✅ definido" : "❌ NO definido");
+console.log("   JWT_SECRET:", process.env.JWT_SECRET ? "✅ definido" : "❌ NO definido");
+console.log("   FRONTEND_URL:", process.env.FRONTEND_URL || "(no definido)");
+
 if (!process.env.JWT_SECRET) {
   console.error("⛔ JWT_SECRET no está definido. El servidor no puede arrancar de forma segura.");
   process.exit(1);
@@ -111,11 +122,12 @@ if (!process.env.FRONTEND_URL) {
 // ===============================================
 // 7. CONECTAR DB + LEVANTAR SERVIDOR
 // ===============================================
+console.log("🔄 Intentando conectar a la base de datos...");
+
 sequelize
   .authenticate()
   .then(() => {
     console.log("✅ Conexión a la base de datos OK");
-    // Crea tablas que no existen (no modifica las existentes)
     return sequelize.sync();
   })
   .then(() => {
@@ -125,6 +137,7 @@ sequelize
     });
   })
   .catch((err) => {
-    console.error("⛔ Error de conexión DB:", err);
-    process.exit(1);
+    console.error("⛔ Error de conexión DB:", err.message || err);
+    // Dar tiempo a que los logs se escriban antes de salir
+    setTimeout(() => process.exit(1), 1000);
   });
