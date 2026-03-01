@@ -213,6 +213,24 @@ router.get(
         costoItemMap[i.id] = Number(i.costoParcial || 0);
       });
 
+      // Helpers
+      const norm = (x) => {
+        if (!x) return "";
+        if (x instanceof Date) return x.toISOString().slice(0, 10);
+        return String(x).slice(0, 10);
+      };
+      const toTime = (d) => {
+        const t = new Date(d).getTime();
+        return Number.isFinite(t) ? t : null;
+      };
+      const inRange = (d, desde, hasta) => {
+        const td = toTime(d);
+        const t1 = toTime(desde);
+        const t2 = toTime(hasta);
+        if (td == null || t1 == null || t2 == null) return false;
+        return td >= t1 && td <= t2;
+      };
+
       // 2) Planificaciones
       const planificaciones = await Planificacion.findAll({
         where: { obraId },
@@ -303,24 +321,6 @@ router.get(
           avanceItemsByAvance[ai.avance_obra_id].push(ai);
         });
       }
-
-      // Helpers
-      const norm = (x) => {
-        if (!x) return "";
-        if (x instanceof Date) return x.toISOString().slice(0, 10);
-        return String(x).slice(0, 10);
-      };
-      const toTime = (d) => {
-        const t = new Date(d).getTime();
-        return Number.isFinite(t) ? t : null;
-      };
-      const inRange = (d, desde, hasta) => {
-        const td = toTime(d);
-        const t1 = toTime(desde);
-        const t2 = toTime(hasta);
-        if (td == null || t1 == null || t2 == null) return false;
-        return td >= t1 && td <= t2;
-      };
 
       // ✅ PRE-CÁLCULO: porcentaje ponderado POR AVANCE
       // Matching por overlap de rangos (no requiere key exacto)
