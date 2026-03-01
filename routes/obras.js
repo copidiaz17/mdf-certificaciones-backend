@@ -236,11 +236,13 @@ router.get(
       const periodosMap = {};
       const periodos = [];
       planificaciones.forEach((p) => {
-        const key = `${String(p.fecha_desde).slice(0, 10)}__${String(p.fecha_hasta).slice(0, 10)}`;
+        const fd = norm(p.fecha_desde);
+        const fh = norm(p.fecha_hasta);
+        const key = `${fd}__${fh}`;
         if (!periodosMap[key]) {
           periodosMap[key] = {
-            fecha_desde: String(p.fecha_desde).slice(0, 10),
-            fecha_hasta: String(p.fecha_hasta).slice(0, 10),
+            fecha_desde: fd,
+            fecha_hasta: fh,
             planifIds: [],
           };
           periodos.push(periodosMap[key]);
@@ -303,7 +305,11 @@ router.get(
       }
 
       // Helpers
-      const norm = (x) => (x ? String(x).slice(0, 10) : "");
+      const norm = (x) => {
+        if (!x) return "";
+        if (x instanceof Date) return x.toISOString().slice(0, 10);
+        return String(x).slice(0, 10);
+      };
       const toTime = (d) => {
         const t = new Date(d).getTime();
         return Number.isFinite(t) ? t : null;
@@ -316,15 +322,14 @@ router.get(
         return td >= t1 && td <= t2;
       };
 
-      // ✅ PRE-CÁLCULO: porcentaje ponderado POR AVANCE (una sola vez)
-      // Y lo mapeamos por clave de período exacto: "YYYY-MM-DD__YYYY-MM-DD"
-      const avancePorPeriodoKey = {}; // keyPeriodo -> suma % (si hay varios avances en mismo período)
-      const avancesSinPeriodo = []; // fallback
+      // ✅ PRE-CÁLCULO: porcentaje ponderado POR AVANCE
+      // Matching por overlap de rangos (no requiere key exacto)
+      const avancePorPeriodoKey = {}; // keyPeriodo -> suma %
+      const avancesSinPeriodo = []; // fallback si no hay overlap con ningún período
 
       avances.forEach((a) => {
         const itemsAv = avanceItemsByAvance[a.id] || [];
 
-        // % ponderado del avance (idéntico criterio a certificaciones)
         let porcAvancePonderado = 0;
         itemsAv.forEach((i) => {
           const costo = costoItemMap[i.pliego_item_id] || 0;
@@ -336,15 +341,27 @@ router.get(
 
         porcAvancePonderado = Number(porcAvancePonderado.toFixed(2));
 
-        const keyExacta = `${norm(a.periodo_desde)}__${norm(a.periodo_hasta)}`;
+        const aDesde = norm(a.periodo_desde);
+        const aHasta = norm(a.periodo_hasta);
 
-        // Si tiene período válido -> lo imputamos SOLO ahí
-        if (norm(a.periodo_desde) && norm(a.periodo_hasta)) {
-          avancePorPeriodoKey[keyExacta] = Number(
-            ((avancePorPeriodoKey[keyExacta] || 0) + porcAvancePonderado).toFixed(2)
+        if (aDesde && aHasta) {
+          // Buscar el período planificado que OVERLAPA con el avance
+          // (evita fallas por diferencias de 1 día por timezone)
+          const matchPeriodo = periodos.find(
+            (p) => aDesde <= p.fecha_hasta && aHasta >= p.fecha_desde
           );
+
+          if (matchPeriodo) {
+            const matchKey = `${matchPeriodo.fecha_desde}__${matchPeriodo.fecha_hasta}`;
+            avancePorPeriodoKey[matchKey] = Number(
+              ((avancePorPeriodoKey[matchKey] || 0) + porcAvancePonderado).toFixed(2)
+            );
+          } else {
+            // Sin overlap → fallback por fecha_avance
+            avancesSinPeriodo.push({ ...a, porc: porcAvancePonderado });
+          }
         } else {
-          // fallback: si algún avance viejo no tiene periodo, lo guardamos para imputarlo por fecha
+          // Sin período definido → fallback por fecha_avance
           avancesSinPeriodo.push({ ...a, porc: porcAvancePonderado });
         }
       });
@@ -806,6 +823,13 @@ router.get(
 router.get("/:obraId/planificaciones", authMiddleware, hasRole([ROLES.ADMIN, ROLES.OPERATOR, ROLES.VIEWER]), async (req, res) => {
   try {
     const { obraId } = req.params;
+
+    // Cargar pliego para calcular ponderación correcta
+    const pliegoItems = await PliegoItem.findAll({ where: { obraId }, attributes: ["id", "costoParcial"], raw: true });
+    const totalProyecto = pliegoItems.reduce((acc, i) => acc + Number(i.costoParcial || 0), 0);
+    const costoMap = {};
+    pliegoItems.forEach((i) => (costoMap[i.id] = Number(i.costoParcial || 0)));
+
     const planificaciones = await Planificacion.findAll({
       where: { obraId },
       order: [["fecha_desde", "ASC"]],
@@ -819,14 +843,30 @@ router.get("/:obraId/planificaciones", authMiddleware, hasRole([ROLES.ADMIN, ROL
       if (!itemsByPlanif[i.planificacion_id]) itemsByPlanif[i.planificacion_id] = [];
       itemsByPlanif[i.planificacion_id].push(i);
     });
-    const result = planificaciones.map((p) => ({
-      id: p.id,
-      nombre: p.nombre,
-      fecha_desde: p.fecha_desde,
-      fecha_hasta: p.fecha_hasta,
-      estado: p.estado,
-      total_porcentaje: (itemsByPlanif[p.id] || []).reduce((s, i) => s + Number(i.porcentaje_planificado || 0), 0),
-    }));
+
+    // Calcular % ponderado acumulado por mes
+    let acumulado = 0;
+    const result = planificaciones.map((p) => {
+      const items = itemsByPlanif[p.id] || [];
+      let ponderado = 0;
+      if (totalProyecto > 0) {
+        items.forEach((i) => {
+          const costo = costoMap[i.pliego_item_id] || 0;
+          ponderado += (Number(i.porcentaje_planificado || 0) / 100) * (costo / totalProyecto) * 100;
+        });
+      }
+      ponderado = Number(ponderado.toFixed(2));
+      acumulado = Number((acumulado + ponderado).toFixed(2));
+      return {
+        id: p.id,
+        nombre: p.nombre,
+        fecha_desde: p.fecha_desde,
+        fecha_hasta: p.fecha_hasta,
+        estado: p.estado,
+        total_porcentaje: ponderado,
+        total_porcentaje_acum: acumulado,
+      };
+    });
     return res.json(result);
   } catch (error) {
     console.error("Error listando planificaciones:", error);
