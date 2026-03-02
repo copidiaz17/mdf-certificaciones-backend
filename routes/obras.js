@@ -574,7 +574,7 @@ router.post(
     } catch (error) {
       await t.rollback();
       console.error("Error guardando avance de obra:", error);
-      return res.status(500).json({ message: "Error al guardar avance de obra" });
+      return res.status(500).json({ message: "Error al guardar avance de obra", debug: error.message, sql: error.sql || null });
     }
   }
 );

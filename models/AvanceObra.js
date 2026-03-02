@@ -25,16 +25,18 @@ const AvanceObra = sequelize.define("AvanceObra", {
 
   periodo_desde: {
     type: DataTypes.DATEONLY,
-    allowNull: false,
+    allowNull: true,
+    defaultValue: null,
   },
 
   periodo_hasta: {
     type: DataTypes.DATEONLY,
-    allowNull: false,
+    allowNull: true,
+    defaultValue: null,
   },
 }, {
   tableName: "avance_obras",
-  timestamps: true,
+  timestamps: false,
 });
 
 export default AvanceObra;
