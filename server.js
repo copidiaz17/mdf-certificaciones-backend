@@ -128,7 +128,7 @@ sequelize
   .authenticate()
   .then(() => {
     console.log("✅ Conexión a la base de datos OK");
-    return sequelize.sync();
+    return sequelize.sync({ alter: true });
   })
   .then(() => {
     console.log("✅ Tablas sincronizadas");
