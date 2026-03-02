@@ -957,7 +957,7 @@ router.get("/:obraId/avances", authMiddleware, hasRole([ROLES.ADMIN, ROLES.OPERA
     return res.json(result);
   } catch (error) {
     console.error("Error listando avances:", error);
-    return res.status(500).json({ message: "Error al listar avances" });
+    return res.status(500).json({ message: "Error al listar avances", debug: error.message, sql: error.sql || null });
   }
 });
 
