@@ -574,7 +574,7 @@ router.post(
     } catch (error) {
       await t.rollback();
       console.error("Error guardando avance de obra:", error);
-      return res.status(500).json({ message: "Error al guardar avance de obra", debug: error.message, sql: error.sql || null });
+      return res.status(500).json({ message: "Error al guardar avance de obra" });
     }
   }
 );
@@ -957,7 +957,7 @@ router.get("/:obraId/avances", authMiddleware, hasRole([ROLES.ADMIN, ROLES.OPERA
     return res.json(result);
   } catch (error) {
     console.error("Error listando avances:", error);
-    return res.status(500).json({ message: "Error al listar avances", debug: error.message, sql: error.sql || null });
+    return res.status(500).json({ message: "Error al listar avances" });
   }
 });
 
