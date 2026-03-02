@@ -939,7 +939,7 @@ router.get("/:obraId/avances", authMiddleware, hasRole([ROLES.ADMIN, ROLES.OPERA
     const totalProyecto = pliegoItems.reduce((acc, i) => acc + Number(i.costoParcial || 0), 0);
     const costoMap = {};
     pliegoItems.forEach((i) => (costoMap[i.id] = Number(i.costoParcial || 0)));
-    const avances = await AvanceObra.findAll({ where: { obra_id: obraId }, order: [["numero_avance", "ASC"]], raw: true });
+    const avances = await AvanceObra.findAll({ where: { obra_id: obraId }, order: [["numero_avance", "ASC"]], raw: true, attributes: ["id", "numero_avance", "fecha_avance", "periodo_desde", "periodo_hasta"] });
     const avanceIds = avances.map((a) => a.id);
     const todosItems = avanceIds.length ? await AvanceObraItem.findAll({ where: { avance_obra_id: avanceIds }, raw: true }) : [];
     const itemsByAvance = {};
