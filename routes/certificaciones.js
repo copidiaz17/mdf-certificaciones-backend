@@ -381,4 +381,36 @@ router.get(
 );
 
 
+/* ==========================================================
+   🔹 EDITAR CABECERA DE UNA CERTIFICACIÓN
+   PUT /api/certificaciones/:certId
+   ========================================================== */
+router.put(
+  "/:certId",
+  authMiddleware,
+  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
+  async (req, res) => {
+    try {
+      const { certId } = req.params;
+      const { numero_certificado, fecha_certificacion, periodo_desde, periodo_hasta } = req.body;
+
+      if (!numero_certificado || !fecha_certificacion || !periodo_desde || !periodo_hasta) {
+        return res.status(400).json({ ok: false, error: "Todos los campos de cabecera son requeridos." });
+      }
+
+      const cert = await Certificacion.findByPk(certId);
+      if (!cert) {
+        return res.status(404).json({ ok: false, error: "Certificación no encontrada." });
+      }
+
+      await cert.update({ numero_certificado, fecha_certificacion, periodo_desde, periodo_hasta });
+
+      return res.json({ ok: true, message: "Certificación actualizada correctamente." });
+    } catch (error) {
+      console.error("Error editando certificación:", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+  }
+);
+
 export default router;
