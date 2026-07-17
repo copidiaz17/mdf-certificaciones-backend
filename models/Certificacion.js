@@ -100,6 +100,16 @@ const Certificacion = sequelize.define(
       allowNull: true,
       defaultValue: 0.0,
     },
+
+    // 🔹 Auditoría: quién emitió y quién editó por última vez (null en registros viejos)
+    creado_por_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+    editado_por_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
   },
   {
     tableName: "certificaciones",

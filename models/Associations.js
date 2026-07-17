@@ -50,6 +50,16 @@ Certificacion.belongsTo(Obra, {
   as: "obra",
 });
 
+// 🔹 Auditoría: creador y último editor de la certificación
+Certificacion.belongsTo(Usuario, {
+  foreignKey: "creado_por_id",
+  as: "creador",
+});
+Certificacion.belongsTo(Usuario, {
+  foreignKey: "editado_por_id",
+  as: "editor",
+});
+
 Certificacion.hasMany(CertificacionItem, {
   foreignKey: "CertificacionId",  // atributo del modelo CertificacionItem
   as: "items",

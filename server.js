@@ -130,8 +130,26 @@ sequelize
     console.log("✅ Conexión a la base de datos OK");
     return sequelize.sync();
   })
-  .then(() => {
+  .then(async () => {
     console.log("✅ Tablas sincronizadas");
+
+    // Migraciones idempotentes: columnas de auditoría en certificaciones
+    const migraciones = [
+      "ALTER TABLE certificaciones ADD COLUMN creado_por_id INT NULL",
+      "ALTER TABLE certificaciones ADD COLUMN editado_por_id INT NULL",
+    ];
+    for (const sql of migraciones) {
+      try {
+        await sequelize.query(sql);
+      } catch (e) {
+        // 1060 = ER_DUP_FIELDNAME (la columna ya existe) → ignorar
+        if (e.original?.errno !== 1060 && !/duplicate column/i.test(e.message)) {
+          console.warn("⚠️ Migración auditoría:", e.message);
+        }
+      }
+    }
+    console.log("✅ Migraciones de auditoría aplicadas");
+
     app.listen(PORT, () => {
       console.log(`✅ Servidor corriendo en puerto ${PORT}`);
     });

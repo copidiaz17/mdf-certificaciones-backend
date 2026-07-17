@@ -6,6 +6,7 @@ import Certificacion from "../models/Certificacion.js";
 import CertificacionItem from "../models/CertificacionItem.js";
 import Obra from "../models/Obra.js";
 import PliegoItem from "../models/PliegoItem.js";
+import Usuario from "../models/Usuario.js";
 
 import { authMiddleware } from "./auth.js";
 import { hasRole, ROLES } from "../middlewares/authorization.js";
@@ -277,6 +278,7 @@ router.post(
           beneficios: tot.beneficios,
           iva: tot.iva,
           ingresos_brutos: tot.ingresos_brutos,
+          creado_por_id: req.user?.id || null, // 🔹 auditoría: quién emitió
         },
         { transaction }
       );
@@ -328,6 +330,16 @@ router.get(
             model: Obra,
             as: "obra",
             attributes: ["id", "nombre", "reparticion"],
+          },
+          {
+            model: Usuario,
+            as: "creador",
+            attributes: ["id", "nombre", "email"],
+          },
+          {
+            model: Usuario,
+            as: "editor",
+            attributes: ["id", "nombre", "email"],
           },
           {
             model: CertificacionItem,
@@ -406,6 +418,16 @@ router.get(
 
         totalProyecto,
         porcentajeFinanciero,
+
+        // 🔹 Auditoría
+        creado_por: certificacion.creador
+          ? { id: certificacion.creador.id, nombre: certificacion.creador.nombre, email: certificacion.creador.email }
+          : null,
+        editado_por: certificacion.editor
+          ? { id: certificacion.editor.id, nombre: certificacion.editor.nombre, email: certificacion.editor.email }
+          : null,
+        creado_en: certificacion.createdAt,
+        editado_en: certificacion.updatedAt,
       };
 
       const itemsDTO = certificacion.items.map((ci) => ({
@@ -458,7 +480,13 @@ router.put(
         return res.status(404).json({ ok: false, error: "Certificación no encontrada." });
       }
 
-      await cert.update({ numero_certificado, fecha_certificacion, periodo_desde, periodo_hasta });
+      await cert.update({
+        numero_certificado,
+        fecha_certificacion,
+        periodo_desde,
+        periodo_hasta,
+        editado_por_id: req.user?.id || null, // 🔹 auditoría: quién editó por última vez
+      });
 
       return res.json({ ok: true, message: "Certificación actualizada correctamente." });
     } catch (error) {
