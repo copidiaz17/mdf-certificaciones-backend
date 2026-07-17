@@ -137,6 +137,8 @@ sequelize
     const migraciones = [
       "ALTER TABLE certificaciones ADD COLUMN creado_por_id INT NULL",
       "ALTER TABLE certificaciones ADD COLUMN editado_por_id INT NULL",
+      "ALTER TABLE certificaciones ADD COLUMN anulada TINYINT(1) NOT NULL DEFAULT 0",
+      "ALTER TABLE certificaciones ADD COLUMN anulada_por_id INT NULL",
     ];
     for (const sql of migraciones) {
       try {

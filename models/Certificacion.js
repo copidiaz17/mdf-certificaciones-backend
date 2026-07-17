@@ -110,6 +110,17 @@ const Certificacion = sequelize.define(
       type: DataTypes.INTEGER,
       allowNull: true,
     },
+
+    // 🔹 Anulación (no se borra: se marca; queda fuera del acumulado y del 100%)
+    anulada: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    anulada_por_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
   },
   {
     tableName: "certificaciones",

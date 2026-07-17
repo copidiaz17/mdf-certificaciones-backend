@@ -1118,8 +1118,12 @@ router.put("/:obraId/avances/:avanceId", authMiddleware, hasRole([ROLES.ADMIN, R
 router.get("/:obraId/items-disponibles-certificacion", authMiddleware, hasRole([ROLES.ADMIN, ROLES.OPERATOR, ROLES.VIEWER]), async (req, res) => {
   try {
     const { obraId } = req.params;
+    // Al editar una certificación, se excluye ella misma para que sus % vuelvan a estar disponibles.
+    const excludeCertId = req.query.excludeCertId ? Number(req.query.excludeCertId) : null;
     const pliegoItems = await PliegoItem.findAll({ where: { obraId }, raw: true });
-    const certs = await Certificacion.findAll({ where: { obra_id: obraId }, attributes: ["id"], raw: true });
+    const certWhere = { obra_id: obraId, anulada: false }; // las anuladas no cuentan
+    if (excludeCertId) certWhere.id = { [Op.ne]: excludeCertId };
+    const certs = await Certificacion.findAll({ where: certWhere, attributes: ["id"], raw: true });
     const accMap = {};
     if (certs.length > 0) {
       const certIds = certs.map((c) => c.id);

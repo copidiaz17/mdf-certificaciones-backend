@@ -59,6 +59,10 @@ Certificacion.belongsTo(Usuario, {
   foreignKey: "editado_por_id",
   as: "editor",
 });
+Certificacion.belongsTo(Usuario, {
+  foreignKey: "anulada_por_id",
+  as: "anulador",
+});
 
 Certificacion.hasMany(CertificacionItem, {
   foreignKey: "CertificacionId",  // atributo del modelo CertificacionItem
