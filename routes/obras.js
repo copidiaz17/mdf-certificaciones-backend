@@ -93,7 +93,10 @@ router.post(
 
     try {
       const { obraId } = req.params;
-      const { fecha_desde, fecha_hasta, items } = req.body;
+      const {
+        fecha_desde, fecha_hasta, items,
+        tipo, motivo, planificacion_padre_id, avance_corte_id,
+      } = req.body;
 
       if (!fecha_desde || !fecha_hasta || !Array.isArray(items) || !items.length) {
         return res.status(400).json({ message: "Datos incompletos para la planificación" });
@@ -103,31 +106,47 @@ router.post(
         return res.status(400).json({ message: "La fecha desde no puede ser mayor que la fecha hasta" });
       }
 
-      const existe = await Planificacion.findOne({
-        where: {
-          obraId,
-          [Op.or]: [
-            { fecha_desde: { [Op.between]: [fecha_desde, fecha_hasta] } },
-            { fecha_hasta: { [Op.between]: [fecha_desde, fecha_hasta] } },
-            {
-              [Op.and]: [
-                { fecha_desde: { [Op.lte]: fecha_desde } },
-                { fecha_hasta: { [Op.gte]: fecha_hasta } },
-              ],
-            },
-          ],
-        },
-      });
+      const tipoValido = tipo === "replanteo" ? "replanteo" : "original";
 
-      if (existe) return res.status(400).json({ message: "Ya existe una planificación en ese período" });
+      // El solapamiento de períodos se controla solo entre planificaciones
+      // ORIGINALES: un replanteo pisa a propósito el período de la que reemplaza.
+      if (tipoValido === "original") {
+        const existe = await Planificacion.findOne({
+          where: {
+            obraId,
+            tipo: "original",
+            [Op.or]: [
+              { fecha_desde: { [Op.between]: [fecha_desde, fecha_hasta] } },
+              { fecha_hasta: { [Op.between]: [fecha_desde, fecha_hasta] } },
+              {
+                [Op.and]: [
+                  { fecha_desde: { [Op.lte]: fecha_desde } },
+                  { fecha_hasta: { [Op.gte]: fecha_hasta } },
+                ],
+              },
+            ],
+          },
+        });
+
+        if (existe) return res.status(400).json({ message: "Ya existe una planificación en ese período" });
+      }
+
+      const motivosValidos = ["tiempo", "adicional_item"];
+      const motivoFinal = motivosValidos.includes(motivo) ? motivo : null;
 
       const planificacion = await Planificacion.create(
         {
           obraId,
-          nombre: `Planificación ${fecha_desde} → ${fecha_hasta}`,
+          nombre: tipoValido === "replanteo"
+            ? `Replanteo ${fecha_desde} → ${fecha_hasta}`
+            : `Planificación ${fecha_desde} → ${fecha_hasta}`,
           fecha_desde,
           fecha_hasta,
           estado: "abierta",
+          tipo: tipoValido,
+          motivo: motivoFinal,
+          planificacion_padre_id: planificacion_padre_id || null,
+          avance_corte_id: avance_corte_id || null,
         },
         { transaction: t }
       );
@@ -250,22 +269,61 @@ router.get(
         });
       }
 
-      // 2.1) Agrupar períodos únicos
-      const periodosMap = {};
+      // 2.1) EJE QUINCENAL
+      // El avance se registra por quincena (del 1 al 15 y del 16 a fin de mes),
+      // que es como se le certifica al subcontratista. Por eso el eje se abre en
+      // dos puntos por mes: así el avance real dibuja su camino con ese detalle.
+      // La planificación y la certificación son mensuales y caen en la segunda
+      // quincena, cuando el mes cierra.
+      //
+      // La curva es ACUMULADA: una quincena sin movimiento queda plana, no cortada.
+      const ULTIMO_DIA = (a, m) => new Date(a, m, 0).getDate();
+      const aFecha = (a, m, d) => `${a}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+
+      // Rango a cubrir: desde la primera planificación hasta la última, más
+      // cualquier avance o certificación que caiga fuera de ese rango.
+      const fechasRelevantes = [
+        ...planificaciones.map((p) => norm(p.fecha_desde)),
+        ...planificaciones.map((p) => norm(p.fecha_hasta)),
+      ].filter(Boolean).sort();
+
+      const primera = fechasRelevantes[0];
+      const ultima = fechasRelevantes[fechasRelevantes.length - 1];
+
       const periodos = [];
+      let [anioCur, mesCur] = [Number(primera.slice(0, 4)), Number(primera.slice(5, 7))];
+      const [anioFin, mesFin] = [Number(ultima.slice(0, 4)), Number(ultima.slice(5, 7))];
+
+      while (anioCur < anioFin || (anioCur === anioFin && mesCur <= mesFin)) {
+        const ultimoDia = ULTIMO_DIA(anioCur, mesCur);
+        periodos.push({
+          fecha_desde: aFecha(anioCur, mesCur, 1),
+          fecha_hasta: aFecha(anioCur, mesCur, 15),
+          quincena: 1,
+          planifIds: [],
+        });
+        periodos.push({
+          fecha_desde: aFecha(anioCur, mesCur, 16),
+          fecha_hasta: aFecha(anioCur, mesCur, ultimoDia),
+          quincena: 2,
+          planifIds: [],
+        });
+        mesCur++;
+        if (mesCur > 12) { mesCur = 1; anioCur++; }
+      }
+
+      // Cada cosa se imputa a la quincena en la que TERMINA: un período se
+      // reconoce cuando cierra. Así una planificación mensual cae en la 2ª
+      // quincena y un avance del 1 al 15 cae en la 1ª.
+      const quincenaDe = (fechaHasta) => {
+        const f = norm(fechaHasta);
+        if (!f) return -1;
+        return periodos.findIndex((p) => f >= p.fecha_desde && f <= p.fecha_hasta);
+      };
+
       planificaciones.forEach((p) => {
-        const fd = norm(p.fecha_desde);
-        const fh = norm(p.fecha_hasta);
-        const key = `${fd}__${fh}`;
-        if (!periodosMap[key]) {
-          periodosMap[key] = {
-            fecha_desde: fd,
-            fecha_hasta: fh,
-            planifIds: [],
-          };
-          periodos.push(periodosMap[key]);
-        }
-        periodosMap[key].planifIds.push(p.id);
+        const i = quincenaDe(p.fecha_hasta);
+        if (i >= 0) periodos[i].planifIds.push(p.id);
       });
 
       // 3) Items de planificacion
@@ -345,11 +403,12 @@ router.get(
         const aHasta = norm(a.periodo_hasta);
 
         if (aDesde && aHasta) {
-          // Buscar el período planificado que OVERLAPA con el avance
-          // (evita fallas por diferencias de 1 día por timezone)
-          const matchPeriodo = periodos.find(
-            (p) => aDesde < p.fecha_hasta && aHasta > p.fecha_desde
-          );
+          // El avance se imputa a la quincena en la que TERMINA. Si por algún
+          // motivo la fecha de cierre no cae en el eje, se busca por solapamiento.
+          const iCierre = quincenaDe(aHasta);
+          const matchPeriodo = iCierre >= 0
+            ? periodos[iCierre]
+            : periodos.find((p) => aDesde < p.fecha_hasta && aHasta > p.fecha_desde);
 
           if (matchPeriodo) {
             const matchKey = `${matchPeriodo.fecha_desde}__${matchPeriodo.fecha_hasta}`;
@@ -400,7 +459,10 @@ router.get(
         const { fecha_desde, fecha_hasta, planifIds } = periodos[idxPeriodo];
         const keyPeriodo = `${fecha_desde}__${fecha_hasta}`;
 
-        labels.push(`${fecha_desde} → ${fecha_hasta}`);
+        const MESES_EJE = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"];
+        const mEje = Number(fecha_desde.slice(5, 7));
+        const aEje = fecha_desde.slice(2, 4);
+        labels.push(`${periodos[idxPeriodo].quincena}ª q ${MESES_EJE[mEje - 1]} ${aEje}`);
 
         // 🔵 PLANIFICADO
         let planPeriodo = 0;
@@ -425,7 +487,13 @@ router.get(
           const cDesde = norm(cert.periodo_desde);
           const cHasta = norm(cert.periodo_hasta);
           if (!cDesde || !cHasta) return;
-          if (!(cDesde < fecha_hasta && cHasta > fecha_desde)) return;
+          // Igual que el avance: el certificado cae en la quincena en la que
+          // cierra su período. Si no encaja en el eje, se usa el solapamiento.
+          const iCierre = quincenaDe(cHasta);
+          const caeAca = iCierre >= 0
+            ? iCierre === idxPeriodo
+            : (cDesde < fecha_hasta && cHasta > fecha_desde);
+          if (!caeAca) return;
 
           certMatchedIds.add(cert.id);
           const itemsCert = certItemsByCert[cert.id] || [];
@@ -551,6 +619,119 @@ router.get(
         });
       }
 
+      // ── Series de planificación: original vs replanteo ────────────────────
+      // Cuando hay replanteos se dibujan DOS curvas, para poder comparar lo
+      // que se prometió con lo que realmente pasó:
+      //   · "original"  → la planificación inicial, como testigo histórico.
+      //   · "replanteo" → híbrida: avance real hasta donde hay avances
+      //                   cargados, y de ahí en adelante lo replanificado.
+      const tieneReplanteos = planificaciones.some((p) => p.tipo === "replanteo");
+      const planificacionesCurvas = [];
+
+      // La serie original se mide contra el presupuesto SIN los ítems
+      // adicionales: si no, un adicional le bajaría el avance hacia atrás.
+      const totalOriginal = pliegoItems
+        .filter((i) => (i.origen || "original") === "original")
+        .reduce((acc, i) => acc + Number(i.costoParcial || 0), 0) || totalProyecto;
+
+      // Curva pura de planificación.
+      const buildSerie = (filterIds, total) => {
+        let ac = 0;
+        const datos = [0];
+        // Indice del ultimo periodo con planificacion: mas alla de eso la
+        // linea se corta (no hay plan). Antes se cortaba en CUALQUIER periodo
+        // sin planificacion, y con el eje quincenal eso partia la curva al medio.
+        let ultimoConPlan = -1;
+        periodos.forEach((p, i) => { if (p.planifIds.some((id) => filterIds.has(id))) ultimoConPlan = i; });
+
+        for (let iP = 0; iP < periodos.length; iP++) {
+          const periodo = periodos[iP];
+          const ids = periodo.planifIds.filter((id) => filterIds.has(id));
+          if (ids.length === 0) {
+            // Dentro del rango planificado la curva sigue plana; despues, corta.
+            datos.push(iP <= ultimoConPlan ? Number(ac.toFixed(2)) : null);
+          } else {
+            let pp = 0;
+            ids.forEach((planifId) => {
+              (planifItemsByPlanif[planifId] || []).forEach((item) => {
+                const costo = costoItemMap[item.pliego_item_id] || 0;
+                pp += (Number(item.porcentaje_planificado) / 100) * (costo / total) * 100;
+              });
+            });
+            ac += pp;
+            datos.push(Number(ac.toFixed(2)));
+          }
+        }
+        while (datos.length < labels.length) datos.push(null);
+        return datos;
+      };
+
+      // Curva híbrida del replanteo: pasado real + futuro replanificado.
+      const buildSerieReplanteoHibrida = (replanteosIds, total) => {
+        let ac = 0;
+        const datos = [0];
+        for (const periodo of periodos) {
+          const key = `${periodo.fecha_desde}__${periodo.fecha_hasta}`;
+          const avancePorc = avancePorPeriodoKey[key];
+          if (avancePorc !== undefined) {
+            // Período con avance real cargado → seguir la curva de avance.
+            ac += Number(avancePorc);
+            datos.push(Number(ac.toFixed(2)));
+          } else {
+            // Período futuro → seguir lo replanificado.
+            const ids = periodo.planifIds.filter((id) => replanteosIds.has(id));
+            if (ids.length === 0) {
+              datos.push(null);
+            } else {
+              let pp = 0;
+              ids.forEach((planifId) => {
+                (planifItemsByPlanif[planifId] || []).forEach((item) => {
+                  const costo = costoItemMap[item.pliego_item_id] || 0;
+                  pp += (Number(item.porcentaje_planificado) / 100) * (costo / total) * 100;
+                });
+              });
+              ac += pp;
+              datos.push(Number(ac.toFixed(2)));
+            }
+          }
+        }
+        while (datos.length < labels.length) datos.push(null);
+        return datos;
+      };
+
+      if (tieneReplanteos) {
+        const originalesIds = new Set(
+          planificaciones.filter((p) => (p.tipo || "original") === "original").map((p) => p.id)
+        );
+        const replanteosOrdenados = planificaciones
+          .filter((p) => p.tipo === "replanteo")
+          .sort((a, b) => a.id - b.id);
+        const replanteosIds = new Set(replanteosOrdenados.map((p) => p.id));
+
+        planificacionesCurvas.push({
+          serie: "original",
+          tipo: "original",
+          esVigente: false,
+          datos: buildSerie(originalesIds, totalOriginal),
+        });
+
+        planificacionesCurvas.push({
+          serie: "replanteo",
+          tipo: "replanteo",
+          motivo: replanteosOrdenados[0]?.motivo || "tiempo",
+          esVigente: true,
+          datos: buildSerieReplanteoHibrida(replanteosIds, totalProyecto),
+        });
+      } else {
+        // Sin replanteos hay una sola serie: la planificación vigente.
+        planificacionesCurvas.push({
+          serie: "original",
+          tipo: "original",
+          esVigente: true,
+          datos: [...curvaPlan],
+        });
+      }
+
       return res.json({
         labels,
         planificado: curvaPlan,
@@ -559,6 +740,7 @@ router.get(
         certNumerosPorPeriodo,
         financiero: curvaFinanciera,
         financieroMontos: curvaFinancieraMontos,
+        planificacionesCurvas,
       });
     } catch (error) {
       console.error("Error curva-avance:", error);
@@ -954,6 +1136,11 @@ router.get("/:obraId/planificaciones", authMiddleware, hasRole([ROLES.ADMIN, ROL
         fecha_desde: p.fecha_desde,
         fecha_hasta: p.fecha_hasta,
         estado: p.estado,
+        // El historial necesita estos dos para distinguir un replanteo de una
+        // planificación original y mostrar por qué se replanteó.
+        tipo: p.tipo || "original",
+        motivo: p.motivo || null,
+        planificacion_padre_id: p.planificacion_padre_id || null,
         total_porcentaje: ponderado,
         total_porcentaje_acum: acumulado,
       };
@@ -1163,5 +1350,73 @@ router.get("/:obraId/items-disponibles-avance", authMiddleware, hasRole([ROLES.A
     return res.status(500).json({ message: "Error al obtener ítems disponibles para avance" });
   }
 });
+
+/* ======================================================
+   ÍTEMS DISPONIBLES PARA REPLANTEAR
+   Disponible = 100% − avance de obra real acumulado por ítem.
+   No se puede replanificar lo que ya está ejecutado.
+====================================================== */
+router.get(
+  "/:obraId/items-disponible-replanteo",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const { obraId } = req.params;
+
+      const items = await PliegoItem.findAll({
+        where: { obraId },
+        order: [["numeroItem", "ASC"]],
+      });
+
+      // Último avance, para sugerirle al frontend desde cuándo replantear.
+      const ultimoAvance = await AvanceObra.findOne({
+        where: { obra_id: obraId },
+        order: [["fecha_avance", "DESC"]],
+        raw: true,
+      });
+
+      // Avance real acumulado por ítem.
+      const avances = await AvanceObra.findAll({ where: { obra_id: obraId }, raw: true });
+      const avanceIds = avances.map((a) => a.id);
+      const avanceAcumByItem = {};
+      if (avanceIds.length > 0) {
+        const avanceItems = await AvanceObraItem.findAll({
+          where: { avance_obra_id: avanceIds },
+          raw: true,
+        });
+        avanceItems.forEach((ai) => {
+          const pid = ai.pliego_item_id;
+          avanceAcumByItem[pid] = (avanceAcumByItem[pid] || 0) + Number(ai.avance_porcentaje || 0);
+        });
+      }
+
+      // Presupuesto total actual, para calcular la incidencia de cada ítem.
+      const presupuestoTotal = items.reduce(
+        (sum, item) => sum + Number(item.costoParcial || 0), 0
+      );
+
+      const result = items
+        .map((item) => {
+          const avanceAcumulado = Math.min(100, Number((avanceAcumByItem[item.id] || 0).toFixed(2)));
+          const porcentajeDisponible = Math.max(0, Number((100 - avanceAcumulado).toFixed(2)));
+          const incidenciaActual = presupuestoTotal > 0
+            ? Number(((Number(item.costoParcial || 0) / presupuestoTotal) * 100).toFixed(2))
+            : 0;
+          return { ...item.toJSON(), avanceAcumulado, porcentajeDisponible, incidenciaActual };
+        })
+        .filter((item) => item.porcentajeDisponible > 0);
+
+      return res.json({
+        items: result,
+        presupuestoTotal,
+        ultimoAvanceFecha: ultimoAvance?.fecha_avance || null,
+        ultimoAvancePeriodoHasta: ultimoAvance?.periodo_hasta || null,
+      });
+    } catch (error) {
+      console.error("Error ítems disponibles replanteo:", error);
+      return res.status(500).json({ error: "Error al cargar ítems disponibles para replanteo" });
+    }
+  }
+);
 
 export default router;

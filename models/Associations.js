@@ -11,6 +11,8 @@ import Planificacion from "./planificacion.js";
 import PlanificacionItem from "./planificacionItem.js";
 import AvanceObra from "./AvanceObra.js";
 import AvanceObraItem from "./AvanceObraItem.js";
+import Subcontrato from "./Subcontrato.js";
+import SubcontratoItem from "./SubcontratoItem.js";
 
 /* ======================================================
    🔹 OBRAS Y PLIEGO
@@ -153,5 +155,18 @@ AvanceObraItem.belongsTo(PliegoItem, {
   foreignKey: "pliego_item_id",
   as: "pliegoItem",
 });
+
+/* ======================================================
+   🔹 SUBCONTRATOS
+====================================================== */
+
+Obra.hasMany(Subcontrato, { foreignKey: "obra_id", as: "subcontratos" });
+Subcontrato.belongsTo(Obra, { foreignKey: "obra_id", as: "obra" });
+
+Subcontrato.hasMany(SubcontratoItem, { foreignKey: "subcontrato_id", as: "items" });
+SubcontratoItem.belongsTo(Subcontrato, { foreignKey: "subcontrato_id", as: "subcontrato" });
+
+PliegoItem.hasMany(SubcontratoItem, { foreignKey: "pliego_item_id", as: "subcontratoItems" });
+SubcontratoItem.belongsTo(PliegoItem, { foreignKey: "pliego_item_id", as: "pliegoItem" });
 
 console.log("✅ Asociaciones Sequelize definidas correctamente");

@@ -7,6 +7,7 @@ dotenv.config();
 
 // Importación de la conexión a la DB
 import { sequelize } from "./database.js";
+import { migrar } from "./migraciones.mjs";
 
 // ===============================================
 // 1. IMPORTAR MODELOS (SOLO BACKEND)
@@ -29,6 +30,7 @@ import pliegosRoutes from "./routes/pliegos.js";
 import catalogoRoutes from "./routes/catalogo.js";
 import certificacionesRoutes from "./routes/certificaciones.js";
 import avanceobraRoutes from "./routes/avanceObra.js";
+import subcontratosRoutes from "./routes/subcontratos.js";
 import usuariosRouter from "./routes/usuarios.js";
 
 const app = express();
@@ -78,6 +80,7 @@ app.use(express.json());
 app.use("/api/auth", authRoutes);
 app.use("/api/obras", obrasRoutes);
 app.use("/api/obras", pliegosRoutes); // pliego-item CRUD bajo /api/obras
+app.use("/api/obras", subcontratosRoutes); // subcontratos bajo /api/obras
 app.use("/api/pliegos", pliegosRoutes);
 app.use("/api/catalogo", catalogoRoutes);
 app.use("/api/certificaciones", certificacionesRoutes);
@@ -133,24 +136,9 @@ sequelize
   .then(async () => {
     console.log("✅ Tablas sincronizadas");
 
-    // Migraciones idempotentes: columnas de auditoría en certificaciones
-    const migraciones = [
-      "ALTER TABLE certificaciones ADD COLUMN creado_por_id INT NULL",
-      "ALTER TABLE certificaciones ADD COLUMN editado_por_id INT NULL",
-      "ALTER TABLE certificaciones ADD COLUMN anulada TINYINT(1) NOT NULL DEFAULT 0",
-      "ALTER TABLE certificaciones ADD COLUMN anulada_por_id INT NULL",
-    ];
-    for (const sql of migraciones) {
-      try {
-        await sequelize.query(sql);
-      } catch (e) {
-        // 1060 = ER_DUP_FIELDNAME (la columna ya existe) → ignorar
-        if (e.original?.errno !== 1060 && !/duplicate column/i.test(e.message)) {
-          console.warn("⚠️ Migración auditoría:", e.message);
-        }
-      }
-    }
-    console.log("✅ Migraciones de auditoría aplicadas");
+    // El esquema se define en un solo lugar: migraciones.mjs.
+    // Si algo falla, el arranque se corta en vez de levantar con la base vieja.
+    await migrar();
 
     app.listen(PORT, () => {
       console.log(`✅ Servidor corriendo en puerto ${PORT}`);

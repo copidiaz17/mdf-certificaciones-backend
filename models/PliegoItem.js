@@ -49,6 +49,18 @@ const PliegoItem = sequelize.define(
       type: DataTypes.DECIMAL(15, 5),
       allowNull: false,
     },
+
+    // Ítems que se incorporan después, con un replanteo por adicionales.
+    origen: {
+      type: DataTypes.ENUM("original", "adicional"),
+      allowNull: false,
+      defaultValue: "original",
+    },
+
+    fecha_incorporacion: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
   },
   {
     tableName: "pliegoitems",   // 🔴 CLAVE
