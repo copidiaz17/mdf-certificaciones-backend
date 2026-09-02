@@ -15,7 +15,10 @@ import AvanceObra from "../models/AvanceObra.js";
 import AvanceObraItem from "../models/AvanceObraItem.js";
 
 import { authMiddleware } from "./auth.js";
-import { hasRole, ROLES } from "../middlewares/authorization.js";
+import { hasRole, ROLES } from "../middlewares/authorization.js";
+import {
+  normalizarItem, acumuladoPorItem, avisosDeExcedente, calcularExcedentes,
+} from "../utils/excedentes.js";
 
 const router = express.Router();
 
@@ -781,30 +784,27 @@ router.post(
       const costoMap = {};
       pliegoItems.forEach((p) => (costoMap[p.id] = Number(p.costoParcial || 0)));
 
-      // ✅ Validar que ningún ítem supere el 100% de avance acumulado
-      const avancesExistentes = await AvanceObra.findAll({
-        where: { obra_id: obraId },
-        attributes: ["id"],
-        raw: true,
-        transaction: t,
-      });
-      if (avancesExistentes.length > 0) {
-        const avanceIds = avancesExistentes.map((a) => a.id);
-        for (const item of items) {
-          if (!item.avance_porcentaje || item.avance_porcentaje <= 0) continue;
-          const totalPrevio = await AvanceObraItem.sum("avance_porcentaje", {
-            where: { avance_obra_id: avanceIds, pliego_item_id: item.pliego_item_id },
-            transaction: t,
-          });
-          const acumuladoPrevio = Number(totalPrevio || 0);
-          if (acumuladoPrevio + Number(item.avance_porcentaje) > 100) {
-            await t.rollback();
-            return res.status(400).json({
-              message: `El ítem ${item.pliego_item_id} supera el 100% de avance (acumulado ${acumuladoPrevio}%, nuevo ${item.avance_porcentaje}%).`,
-            });
-          }
-        }
+      // El avance de obra NO tiene tope: es lo que se ejecutó de verdad.
+      // Antes esto RECHAZABA todo lo que pasara del 100%, así que una
+      // excavación de 200 m3 sobre 50 presupuestados no se podía registrar.
+      // Ahora se guarda y se avisa. El tope sigue estando donde corresponde:
+      // en la certificación, que es lo que se factura.
+      const pliegoCompleto = await PliegoItem.findAll({ where: { obraId }, transaction: t });
+      const pliegoPorId = new Map(pliegoCompleto.map((x) => [x.id, x]));
+
+      const ajenos = items.filter((i) => !pliegoPorId.has(Number(i.pliego_item_id)));
+      if (ajenos.length > 0) {
+        await t.rollback();
+        return res.status(400).json({
+          message: `Hay ${ajenos.length} ítem(s) que no pertenecen al pliego de esta obra.`,
+        });
       }
+
+      const acumuladoPrevio = await acumuladoPorItem(obraId, t);
+      const itemsNormalizados = items.map((i) =>
+        normalizarItem(i, pliegoPorId.get(Number(i.pliego_item_id)))
+      );
+      const avisos = avisosDeExcedente(itemsNormalizados, pliegoPorId, acumuladoPrevio);
 
       const avance = await AvanceObra.create(
         {
@@ -817,12 +817,9 @@ router.post(
         { transaction: t }
       );
 
-      // ✅ guardar % por item
-      const avanceItems = items.map((i) => ({
-        avance_obra_id: avance.id,
-        pliego_item_id: i.pliego_item_id,
-        avance_porcentaje: Number(i.avance_porcentaje || 0),
-      }));
+      // Se guarda el porcentaje Y la cantidad ejecutada: el excedente se
+      // discute en obra en m3, no en porcentaje.
+      const avanceItems = itemsNormalizados.map((i) => ({ ...i, avance_obra_id: avance.id }));
 
       await AvanceObraItem.bulkCreate(avanceItems, { transaction: t });
 
@@ -843,6 +840,9 @@ router.post(
         id: avance.id,
         avance_periodo_ponderado: Number(avancePeriodoPonderado.toFixed(2)),
         items_insertados: avanceItems.length,
+        // Avisos, no errores: el avance ya se guardó.
+        avisos,
+        hay_excedentes: avisos.length > 0,
       });
     } catch (error) {
       await t.rollback();
@@ -1272,26 +1272,24 @@ router.put("/:obraId/avances/:avanceId", authMiddleware, hasRole([ROLES.ADMIN, R
     }
     const avance = await AvanceObra.findByPk(avanceId, { transaction: t });
     if (!avance) { await t.rollback(); return res.status(404).json({ message: "Avance no encontrado" }); }
-    // Validar 100% excluyendo el avance actual
-    const otrosAvances = await AvanceObra.findAll({ where: { obra_id: obraId, id: { [Op.ne]: avanceId } }, attributes: ["id"], raw: true, transaction: t });
-    if (otrosAvances.length > 0) {
-      const otrosIds = otrosAvances.map((a) => a.id);
-      for (const item of items) {
-        if (!item.avance_porcentaje || item.avance_porcentaje <= 0) continue;
-        const totalPrevio = await AvanceObraItem.sum("avance_porcentaje", { where: { avance_obra_id: otrosIds, pliego_item_id: item.pliego_item_id }, transaction: t });
-        const acumuladoPrevio = Number(totalPrevio || 0);
-        if (acumuladoPrevio + Number(item.avance_porcentaje) > 100) {
-          await t.rollback();
-          return res.status(400).json({ message: `El ítem ${item.pliego_item_id} supera el 100% (acumulado ${acumuladoPrevio}%, nuevo ${item.avance_porcentaje}%).` });
-        }
-      }
+    // Sin tope, igual que al crear. El acumulado se calcula EXCLUYENDO este
+    // avance, o sus propios porcentajes se contarían dos veces.
+    const pliegoCompleto = await PliegoItem.findAll({ where: { obraId }, transaction: t });
+    const pliegoPorId = new Map(pliegoCompleto.map((x) => [x.id, x]));
+    const ajenos = items.filter((i) => !pliegoPorId.has(Number(i.pliego_item_id)));
+    if (ajenos.length > 0) {
+      await t.rollback();
+      return res.status(400).json({ message: `Hay ${ajenos.length} ítem(s) que no pertenecen al pliego de esta obra.` });
     }
+    const acumuladoOtros = await acumuladoPorItem(obraId, t, avanceId);
+    const itemsNormalizados = items.map((i) => normalizarItem(i, pliegoPorId.get(Number(i.pliego_item_id))));
+    const avisos = avisosDeExcedente(itemsNormalizados, pliegoPorId, acumuladoOtros);
     await avance.update({ numero_avance, fecha_avance, periodo_desde: periodo_desde || null, periodo_hasta: periodo_hasta || null }, { transaction: t });
     await AvanceObraItem.destroy({ where: { avance_obra_id: avanceId }, transaction: t });
-    const nuevosItems = items.map((i) => ({ avance_obra_id: Number(avanceId), pliego_item_id: i.pliego_item_id, avance_porcentaje: Number(i.avance_porcentaje || 0) }));
+    const nuevosItems = itemsNormalizados.map((i) => ({ ...i, avance_obra_id: Number(avanceId) }));
     await AvanceObraItem.bulkCreate(nuevosItems, { transaction: t });
     await t.commit();
-    return res.json({ ok: true, message: "Avance actualizado correctamente" });
+    return res.json({ ok: true, message: "Avance actualizado correctamente", avisos, hay_excedentes: avisos.length > 0 });
   } catch (error) {
     await t.rollback();
     console.error("Error editando avance:", error);
@@ -1342,8 +1340,20 @@ router.get("/:obraId/items-disponibles-avance", authMiddleware, hasRole([ROLES.A
       avanceItems.forEach((ai) => { accMap[ai.pliego_item_id] = (accMap[ai.pliego_item_id] || 0) + Number(ai.avance_porcentaje || 0); });
     }
     const result = pliegoItems
-      .map((p) => ({ ...p, porcentajeDisponible: Math.max(0, Number((100 - (accMap[p.id] || 0)).toFixed(2))) }))
-      .filter((p) => p.porcentajeDisponible > 0);
+      // Los ítems que ya llegaron al 100% NO se esconden. Antes se filtraban y
+      // desaparecían del formulario, así que a un ítem terminado era imposible
+      // cargarle nada más — justo el caso del excedente. Se devuelven con
+      // `completo: true` y la pantalla decide cómo mostrarlos.
+      .map((p) => {
+        const acumulado = Number((accMap[p.id] || 0).toFixed(2));
+        return {
+          ...p,
+          acumulado,
+          porcentajeDisponible: Math.max(0, Number((100 - acumulado).toFixed(2))),
+          completo: acumulado >= 100,
+          excedido: acumulado > 100,
+        };
+      });
     return res.json(result);
   } catch (error) {
     console.error("Error items-disponibles-avance:", error);

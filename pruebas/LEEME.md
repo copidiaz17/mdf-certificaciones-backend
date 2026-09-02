@@ -25,3 +25,4 @@ NODE_ENV=development DB_HOST=localhost DB_PORT=3306 \
 |---|---|
 | `excedentes.mjs` | El avance puede superar el pliego, avisa, y el excedente queda en cantidad |
 | `excedente-a-item.mjs` | Convertir el excedente en un ítem nuevo sin precio, y la API entre sistemas |
+| `avance-ruta-real.mjs` | La ruta que USA la aplicación (`POST /obras/:id/avances`), que es distinta de `/avanceObra` |

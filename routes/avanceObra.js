@@ -9,6 +9,14 @@ import PliegoItem from "../models/PliegoItem.js";
 import { authMiddleware } from "./auth.js";
 import { hasRole, ROLES } from "../middlewares/authorization.js";
 
+// La regla de excedentes vive en un solo lugar: hay dos rutas que crean
+// avances y ya pasó en este proyecto que la misma regla escrita dos veces
+// terminara diciendo cosas distintas.
+import {
+  aNumero, r2, r5, TOLERANCIA,
+  normalizarItem, acumuladoPorItem, avisosDeExcedente, calcularExcedentes,
+} from "../utils/excedentes.js";
+
 const router = express.Router();
 
 // ── Avance de obra vs. certificación ───────────────────────────────────────
@@ -30,121 +38,6 @@ const router = express.Router();
 // El excedente se registra en CANTIDAD y SIN PRECIO. Cuánto vale lo ejecutado
 // de más no lo decide quien carga el avance: se define después, en la
 // redeterminación o el replanteo, y recién ahí entra la plata.
-
-const aNumero = (v) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-};
-const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
-const r5 = (n) => Math.round((Number(n) || 0) * 100000) / 100000;
-
-// Un centésimo de tolerancia: 100.004% es 100%, no un excedente.
-const TOLERANCIA = 0.01;
-
-/**
- * Normaliza un ítem del avance.
- *
- * Se puede mandar la cantidad ejecutada o el porcentaje; lo que falte se
- * deriva. La cantidad manda cuando viene, porque es lo que se mide en obra.
- */
-function normalizarItem(entrada, pliego) {
-  const cantidadPliego = aNumero(pliego?.cantidad);
-  const vieneCantidad =
-    entrada.cantidad_ejecutada !== undefined &&
-    entrada.cantidad_ejecutada !== null &&
-    entrada.cantidad_ejecutada !== "";
-
-  let porcentaje;
-  let cantidadFinal;
-
-  if (vieneCantidad) {
-    cantidadFinal = Math.max(0, aNumero(entrada.cantidad_ejecutada));
-    // Un ítem del pliego con cantidad 0 no permite derivar el porcentaje: se
-    // usa el que hayan mandado en vez de dividir por cero.
-    porcentaje =
-      cantidadPliego > 0
-        ? (cantidadFinal / cantidadPliego) * 100
-        : aNumero(entrada.avance_porcentaje);
-  } else {
-    porcentaje = Math.max(0, aNumero(entrada.avance_porcentaje));
-    cantidadFinal = cantidadPliego > 0 ? (cantidadPliego * porcentaje) / 100 : null;
-  }
-
-  return {
-    pliego_item_id: Number(pliego.id),
-    avance_porcentaje: r2(porcentaje),
-    cantidad_ejecutada: cantidadFinal === null ? null : r5(cantidadFinal),
-  };
-}
-
-/**
- * Lo acumulado por ítem en los avances YA guardados de una obra.
- * Devuelve un Map pliego_item_id → { porcentaje, cantidad }.
- */
-async function acumuladoPorItem(obraId, transaction = null, excluirAvanceId = null) {
-  const where = { obra_id: obraId };
-  if (excluirAvanceId) where.id = { [Op.ne]: excluirAvanceId };
-
-  const avances = await AvanceObra.findAll({ where, attributes: ["id"], transaction });
-  const ids = avances.map((a) => a.id);
-  if (ids.length === 0) return new Map();
-
-  const items = await AvanceObraItem.findAll({
-    where: { avance_obra_id: { [Op.in]: ids } },
-    transaction,
-  });
-
-  const acumulado = new Map();
-  for (const i of items) {
-    const previo = acumulado.get(i.pliego_item_id) || { porcentaje: 0, cantidad: 0 };
-    previo.porcentaje += aNumero(i.avance_porcentaje);
-    previo.cantidad += aNumero(i.cantidad_ejecutada);
-    acumulado.set(i.pliego_item_id, previo);
-  }
-  return acumulado;
-}
-
-/**
- * Los avisos de excedente de un conjunto de ítems que se está por guardar.
- *
- * Son AVISOS, no errores: el avance se guarda igual. Quien carga tiene que
- * enterarse de que se pasó del pliego; impedírselo no cambia lo que ya se hizo
- * en la obra, solo hace que el dato no quede registrado.
- */
-function avisosDeExcedente(itemsNormalizados, pliegoPorId, acumulado) {
-  const avisos = [];
-  for (const i of itemsNormalizados) {
-    const pliego = pliegoPorId.get(i.pliego_item_id);
-    if (!pliego) continue;
-
-    const previo = acumulado.get(i.pliego_item_id) || { porcentaje: 0, cantidad: 0 };
-    const totalPct = previo.porcentaje + aNumero(i.avance_porcentaje);
-    if (totalPct <= 100 + TOLERANCIA) continue;
-
-    const cantidadPliego = aNumero(pliego.cantidad);
-    const totalCantidad = previo.cantidad + aNumero(i.cantidad_ejecutada);
-    const excedente = cantidadPliego > 0 ? totalCantidad - cantidadPliego : null;
-    const unidad = pliego.unidadMedida || "";
-
-    avisos.push({
-      pliego_item_id: i.pliego_item_id,
-      numero_item: pliego.numeroItem,
-      descripcion: pliego.descripcionItem,
-      unidad,
-      cantidad_pliego: r5(cantidadPliego),
-      cantidad_ejecutada: r5(totalCantidad),
-      excedente: excedente === null ? null : r5(excedente),
-      acumulado_porcentaje: r2(totalPct),
-      mensaje:
-        excedente !== null && cantidadPliego > 0
-          ? `El ítem ${pliego.numeroItem} (${pliego.descripcionItem}) queda en ${r2(totalPct)}%: ` +
-            `${r5(totalCantidad)} ${unidad} ejecutados contra ${r5(cantidadPliego)} ${unidad} del pliego. ` +
-            `Excedente: ${r5(excedente)} ${unidad}.`
-          : `El ítem ${pliego.numeroItem} (${pliego.descripcionItem}) queda en ${r2(totalPct)}%, por encima del pliego.`,
-    });
-  }
-  return avisos;
-}
 
 /**
  * PREVISUALIZAR — qué avisos saldrían, sin guardar nada.
@@ -194,48 +87,7 @@ router.get("/:obraId/excedentes", authMiddleware, async (req, res) => {
     }
 
     const acumulado = await acumuladoPorItem(obraId);
-
-    // Lo que ya se convirtió en ítem nuevo se descuenta del pendiente. Un
-    // excedente puede reconocerse en partes —100 de 150 m3 en el replanteo de
-    // junio y el resto en un adicional al final— así que se suma por ítem origen.
-    const convertido = new Map();
-    for (const p of pliego) {
-      if (p.origen !== "excedente" || !p.item_origen_id) continue;
-      convertido.set(p.item_origen_id, aNumero(convertido.get(p.item_origen_id)) + aNumero(p.cantidad));
-    }
-
-    const excedentes = [];
-    let conAvance = 0;
-    for (const p of pliego) {
-      // Un ítem que YA es un excedente convertido no genera excedente propio.
-      if (p.origen === "excedente") continue;
-      const acu = acumulado.get(p.id);
-      if (!acu) continue;
-      conAvance++;
-      if (acu.porcentaje <= 100 + TOLERANCIA) continue;
-
-      const cantidadPliego = aNumero(p.cantidad);
-      const total = r5(Math.max(0, acu.cantidad - cantidadPliego));
-      const yaConvertido = r5(convertido.get(p.id) || 0);
-
-      excedentes.push({
-        pliego_item_id: p.id,
-        numero_item: p.numeroItem,
-        descripcion: p.descripcionItem,
-        unidad: p.unidadMedida || "",
-        origen: p.origen,
-        cantidad_pliego: r5(cantidadPliego),
-        cantidad_ejecutada: r5(acu.cantidad),
-        // Lo que se hizo de más. SIN PRECIO a propósito: cuánto vale se define
-        // en el replanteo, no lo decide quien carga el avance.
-        excedente: total,
-        // Lo que todavía no se reconoció en ningún ítem nuevo.
-        ya_convertido: yaConvertido,
-        pendiente: r5(Math.max(0, total - yaConvertido)),
-        acumulado_porcentaje: r2(acu.porcentaje),
-        excedente_porcentaje: r2(acu.porcentaje - 100),
-      });
-    }
+    const { excedentes, conAvance } = calcularExcedentes(pliego, acumulado);
 
     return res.json({
       excedentes,
