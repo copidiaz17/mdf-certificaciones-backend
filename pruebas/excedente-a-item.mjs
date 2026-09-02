@@ -118,11 +118,25 @@ try {
   check("la diferencia es el trabajo hecho sin facturar", cerca(t?.diferencia, 500000), `→ ${t?.diferencia}`);
   check("y lo explica en castellano", /derechos a facturar/i.test(t?.interpretacion || ""), `→ ${t?.interpretacion}`);
   check("avisa que hay items sin precio", t?.items_sin_precio === 2, `→ ${t?.items_sin_precio}`);
-  check("y cuantos items tienen excedente", t?.items_con_excedente === 1, `→ ${t?.items_con_excedente}`);
 
+  console.log("\n=== EL EXCEDENTE NO CRUZA ===");
   const itExc = (r.data?.items || []).find((i) => i.pliego_item_id === itemExcav);
-  check("el item trae el excedente en cantidad", cerca(itExc?.excedente_cantidad, 150), `→ ${itExc?.excedente_cantidad}`);
-  check("el excedente NO se valoriza", cerca(itExc?.ejecutado_importe, 500000), `→ ${itExc?.ejecutado_importe}`);
+  // Se ejecutaron 200 m3 de 50. Al sistema de contabilidad le llegan 50.
+  check("la cantidad viene TOPADA al pliego (50, no 200)", cerca(itExc?.cantidad_reconocida, 50),
+    `→ ${itExc?.cantidad_reconocida}`);
+  check("el porcentaje viene topado al 100 (no 400)", cerca(itExc?.avance_reconocido_porcentaje, 100),
+    `→ ${itExc?.avance_reconocido_porcentaje}`);
+  check("NO manda el excedente en ningun campo",
+    itExc?.excedente_cantidad === undefined && itExc?.excedente === undefined,
+    `→ ${JSON.stringify(Object.keys(itExc || {}))}`);
+  check("ni el total lo cuenta", t?.items_con_excedente === undefined, `→ ${t?.items_con_excedente}`);
+  const crudo = JSON.stringify(r.data);
+  check("los 200 m3 no aparecen en ningun lado de la respuesta", !/200/.test(crudo.replace(/500000/g, "")),
+    "el excedente se filtro en la respuesta");
+  check("el importe se valoriza al tope, no al ejecutado", cerca(itExc?.ejecutado_importe, 500000),
+    `→ ${itExc?.ejecutado_importe}`);
+  check("y la respuesta explica el alcance", /TOPADO|reclamo a negociar/i.test(r.data?.alcance || ""),
+    `→ ${r.data?.alcance}`);
   const itNuevo = (r.data?.items || []).find((i) => i.origen === "excedente");
   check("los items de excedente vienen marcados sin_precio", itNuevo?.sin_precio === true);
   check("y con su item de origen", Number(itNuevo?.item_origen_id) === itemExcav, `→ ${itNuevo?.item_origen_id}`);

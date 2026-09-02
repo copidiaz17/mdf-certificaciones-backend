@@ -5,20 +5,36 @@
 // que se renombra acá rompe allá sin aviso. Con una API de por medio, lo que
 // se promete es la respuesta, no la tabla.
 //
-// ── Qué expone y por qué ─────────────────────────────────────────────────
+// ── Qué expone, y sobre todo qué NO ──────────────────────────────────────
 //
-// El sistema de costos necesita armar el informe de obra en curso (WIP), que
-// la RT 54 exige desde los ejercicios iniciados el 1/1/2025: reconocer el
-// ingreso por GRADO DE AVANCE y mostrar lo devengado-no-facturado como
-// "derechos a facturar".
+// Cruzan tres cosas: LO PLANIFICADO (el pliego), LO CERTIFICADO, y el avance
+// TOPADO A LO PLANIFICADO.
 //
-// Ese informe necesita cuatro números por obra, y tres salen de acá:
-//   · precio de contrato          → el pliego
-//   · avance físico               → los avances de obra
-//   · certificado a la fecha      → las certificaciones
-// El cuarto —el costo incurrido— lo tiene el sistema de costos.
+// EL EXCEDENTE NO CRUZA. Nunca.
 //
-// La diferencia entre lo ejecutado y lo certificado es la que importa:
+// Lo ejecutado por encima del pliego —200 m3 de excavación donde había 50— no
+// es todavía de la empresa: es un reclamo que se negocia después con la
+// Municipalidad o con Arquitectura, y puede terminar reconocido entero, en
+// parte, o no reconocido. Mandarlo al sistema de contabilidad lo pondría a un
+// paso de convertirse en un activo, y contablemente no lo es hasta que lo
+// reconozcan. La RT 54 y la NIIF 15 dicen lo mismo sobre la contraprestación
+// variable: se reconoce cuando es altamente probable que no haya que dar
+// marcha atrás, y un excedente sin negociar no llega a esa vara.
+//
+// El excedente vive de este lado, en la pantalla de excedentes, hasta que se
+// convierte en un ítem del pliego con precio. Recién ahí cruza, y cruza como
+// lo que es: un ítem contratado.
+//
+// Con lo que sí cruza alcanza para el informe de obra en curso (WIP) que la
+// RT 54 exige desde los ejercicios iniciados el 1/1/2025:
+//   · precio de contrato     → el pliego
+//   · avance reconocido      → los avances, topados al 100% de cada ítem
+//   · certificado a la fecha → las certificaciones
+// El costo incurrido lo tiene el sistema de costos.
+//
+// La diferencia entre lo ejecutado y lo certificado es la que importa, y por
+// eso el avance sí cruza aunque topado: sin él, ejecutado y certificado serían
+// siempre iguales y no habría manera de ver el desfasaje.
 //   ejecutado > certificado  → trabajo hecho y no facturado (activo)
 //   certificado > ejecutado  → cobrado por adelantado (pasivo)
 //
@@ -138,13 +154,16 @@ router.get("/obras/:obraId/avance", async (req, res) => {
 
     for (const p of pliego) {
       const precio = aNumero(p.costoParcial);
+      const cantidadPliego = aNumero(p.cantidad);
       const eje = ejecutado.get(p.id) || { porcentaje: 0, cantidad: 0 };
       const cer = certificado.get(p.id) || { porcentaje: 0, importe: 0 };
 
-      // Lo ejecutado valorizado al precio del pliego. Para un ítem de
-      // excedente el precio todavía es 0, así que aporta cantidad pero no
-      // plata — que es exactamente lo que corresponde hasta que se negocie.
-      const ejecutadoImporte = r2((precio * Math.min(eje.porcentaje, 100)) / 100);
+      // ── EL TOPE ──────────────────────────────────────────────────────
+      // El avance cruza topado a lo planificado. Lo ejecutado de más se queda
+      // de este lado hasta que se negocie: no es de la empresa todavía.
+      const avancePct = Math.min(eje.porcentaje, 100);
+      const avanceCantidad = cantidadPliego > 0 ? Math.min(eje.cantidad, cantidadPliego) : eje.cantidad;
+      const ejecutadoImporte = r2((precio * avancePct) / 100);
 
       items.push({
         pliego_item_id: p.id,
@@ -153,16 +172,17 @@ router.get("/obras/:obraId/avance", async (req, res) => {
         unidad: p.unidadMedida || "",
         origen: p.origen,
         item_origen_id: p.item_origen_id ?? null,
-        // sin precio todavía: es un excedente esperando que lo negocien
+        // Un ítem nacido de un excedente entra recién cuando le ponen precio.
+        // Mientras tanto aporta cantidad pero no plata, que es lo correcto.
         sin_precio: precio === 0,
 
-        cantidad_pliego: r5(aNumero(p.cantidad)),
+        cantidad_pliego: r5(cantidadPliego),
         precio_contrato: r2(precio),
 
-        cantidad_ejecutada: r5(eje.cantidad),
-        avance_porcentaje: r2(eje.porcentaje),
-        // Lo ejecutado por encima del pliego NO se valoriza: no tiene precio.
-        excedente_cantidad: r5(Math.max(0, eje.cantidad - aNumero(p.cantidad))),
+        // Reconocido = topado al plan. El nombre lo dice para que nadie del
+        // otro lado lo confunda con el avance físico real.
+        cantidad_reconocida: r5(avanceCantidad),
+        avance_reconocido_porcentaje: r2(avancePct),
         ejecutado_importe: ejecutadoImporte,
 
         certificado_porcentaje: r2(cer.porcentaje),
@@ -176,7 +196,6 @@ router.get("/obras/:obraId/avance", async (req, res) => {
       totales.ejecutado_importe += ejecutadoImporte;
       totales.certificado_importe += cer.importe;
       if (precio === 0) totales.items_sin_precio++;
-      if (eje.porcentaje > 100.01) totales.items_con_excedente++;
     }
 
     for (const k of ["precio_contrato", "ejecutado_importe", "certificado_importe"]) {
@@ -198,6 +217,13 @@ router.get("/obras/:obraId/avance", async (req, res) => {
       obra: { id: obra.id, nombre: obra.nombre },
       items,
       totales,
+      // Que quede dicho en la respuesta y no solo en el código: quien consuma
+      // esto tiene que saber qué está recibiendo y qué no.
+      alcance:
+        "El avance viene TOPADO a lo planificado en el pliego. Lo ejecutado por " +
+        "encima no se informa: es un reclamo a negociar con el comitente y no es " +
+        "un activo hasta que lo reconozcan. Cuando se reconoce, entra como un " +
+        "ítem más del pliego con su precio.",
       ultimo_avance: avances.length
         ? avances.map((a) => a.fecha_avance).sort().pop()
         : null,
@@ -216,8 +242,9 @@ function vacio() {
     precio_contrato: 0,
     ejecutado_importe: 0,
     certificado_importe: 0,
+    // Ítems del pliego que todavía no tienen precio (excedentes reconocidos
+    // pero sin negociar). Aportan cantidad, no plata.
     items_sin_precio: 0,
-    items_con_excedente: 0,
     avance_porcentaje: 0,
     diferencia: 0,
   };
