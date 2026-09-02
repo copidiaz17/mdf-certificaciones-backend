@@ -30,6 +30,7 @@ import pliegosRoutes from "./routes/pliegos.js";
 import catalogoRoutes from "./routes/catalogo.js";
 import certificacionesRoutes from "./routes/certificaciones.js";
 import avanceobraRoutes from "./routes/avanceObra.js";
+import publicaRoutes from "./routes/publica.js";
 import subcontratosRoutes from "./routes/subcontratos.js";
 import usuariosRouter from "./routes/usuarios.js";
 
@@ -85,6 +86,8 @@ app.use("/api/pliegos", pliegosRoutes);
 app.use("/api/catalogo", catalogoRoutes);
 app.use("/api/certificaciones", certificacionesRoutes);
 app.use("/api/avanceObra", avanceobraRoutes);
+// API entre sistemas: la consume el sistema de costos/contabilidad.
+app.use("/api/publica", publicaRoutes);
 app.use("/api/usuarios", usuariosRouter);
 
 // Health / ping

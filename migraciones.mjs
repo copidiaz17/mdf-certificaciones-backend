@@ -89,6 +89,15 @@ export async function migrar({ silencioso = false } = {}) {
 
   // ── pliegoitems: ítems adicionales ───────────────────────────────────────
   await agregarColumna("pliegoitems", "origen", "ENUM('original','adicional') NOT NULL DEFAULT 'original'", log);
+  // ── Ítems nacidos de un excedente ──────────────────────────────────
+  // Cuando se ejecuta más de lo que decía el pliego, eso NO se resuelve
+  // agrandándole la cantidad al ítem original: se crea un ítem nuevo, porque el
+  // precio de lo ejecutado de más todavía no se sabe y se negocia aparte.
+  //
+  // `item_origen_id` es lo que lo hace rastreable: dice de qué ítem salió. Sin
+  // eso, un ítem "1.1 EXC" con precio 0 es un misterio dentro de seis meses.
+  await ajustarColumna("pliegoitems", "origen", "ENUM('original','adicional','excedente') NOT NULL DEFAULT 'original'", log);
+  await agregarColumna("pliegoitems", "item_origen_id", "INT NULL DEFAULT NULL", log);
   await agregarColumna("pliegoitems", "fecha_incorporacion", "DATE NULL DEFAULT NULL", log);
 
   // ── planificaciones: replanteo ───────────────────────────────────────────

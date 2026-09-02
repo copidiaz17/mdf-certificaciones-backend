@@ -1,0 +1,226 @@
+// API para que otros sistemas lean lo de acá.
+//
+// La usa el sistema de costos/contabilidad. Hasta ahora se conectaba a esta
+// base por MySQL directo, lo que ata los dos sistemas al esquema: una columna
+// que se renombra acá rompe allá sin aviso. Con una API de por medio, lo que
+// se promete es la respuesta, no la tabla.
+//
+// ── Qué expone y por qué ─────────────────────────────────────────────────
+//
+// El sistema de costos necesita armar el informe de obra en curso (WIP), que
+// la RT 54 exige desde los ejercicios iniciados el 1/1/2025: reconocer el
+// ingreso por GRADO DE AVANCE y mostrar lo devengado-no-facturado como
+// "derechos a facturar".
+//
+// Ese informe necesita cuatro números por obra, y tres salen de acá:
+//   · precio de contrato          → el pliego
+//   · avance físico               → los avances de obra
+//   · certificado a la fecha      → las certificaciones
+// El cuarto —el costo incurrido— lo tiene el sistema de costos.
+//
+// La diferencia entre lo ejecutado y lo certificado es la que importa:
+//   ejecutado > certificado  → trabajo hecho y no facturado (activo)
+//   certificado > ejecutado  → cobrado por adelantado (pasivo)
+//
+// ── Autenticación ────────────────────────────────────────────────────────
+// Token compartido en la cabecera X-API-Token, contra API_TOKEN del .env.
+// Es de sistema a sistema, no de persona: no hay usuario ni sesión. Si el
+// token no está configurado, la API queda CERRADA en vez de abierta — un
+// endpoint que se abre solo porque falta una variable de entorno es la manera
+// más fácil de publicar los números de la empresa sin querer.
+
+import express from "express";
+import { Op } from "sequelize";
+import PliegoItem from "../models/PliegoItem.js";
+import AvanceObra from "../models/AvanceObra.js";
+import AvanceObraItem from "../models/AvanceObraItem.js";
+import Certificacion from "../models/Certificacion.js";
+import CertificacionItem from "../models/CertificacionItem.js";
+import Obra from "../models/Obra.js";
+
+const router = express.Router();
+
+const aNumero = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const r5 = (n) => Math.round((Number(n) || 0) * 100000) / 100000;
+
+function soloConToken(req, res, next) {
+  const esperado = process.env.API_TOKEN;
+  if (!esperado) {
+    return res.status(503).json({
+      error:
+        "La API entre sistemas no está habilitada en este servidor. " +
+        "Falta configurar API_TOKEN en el .env.",
+    });
+  }
+  const recibido = req.get("X-API-Token") || "";
+  if (recibido !== esperado) {
+    return res.status(401).json({ error: "Token inválido" });
+  }
+  next();
+}
+
+router.use(soloConToken);
+
+// ── GET /api/publica/obras ───────────────────────────────────────────────
+// Las obras, para que el otro sistema pueda mapearlas contra las suyas.
+router.get("/obras", async (req, res) => {
+  try {
+    const obras = await Obra.findAll({ order: [["nombre", "ASC"]] });
+    res.json({
+      obras: obras.map((o) => ({
+        id: o.id,
+        nombre: o.nombre,
+        reparticion: o.reparticion ?? null,
+        ubicacion: o.ubicacion ?? null,
+      })),
+    });
+  } catch (e) {
+    console.error("API pública / obras:", e);
+    res.status(500).json({ error: "Error al obtener las obras" });
+  }
+});
+
+// ── GET /api/publica/obras/:obraId/avance ────────────────────────────────
+// El estado de la obra, ítem por ítem: lo contratado, lo ejecutado y lo
+// certificado. Es la materia prima del WIP.
+router.get("/obras/:obraId/avance", async (req, res) => {
+  try {
+    const { obraId } = req.params;
+
+    const obra = await Obra.findByPk(obraId);
+    if (!obra) return res.status(404).json({ error: "La obra no existe" });
+
+    const pliego = await PliegoItem.findAll({ where: { obraId }, order: [["numeroItem", "ASC"]] });
+    if (pliego.length === 0) {
+      return res.json({ obra: { id: obra.id, nombre: obra.nombre }, items: [], totales: vacio() });
+    }
+
+    // ── Avance físico acumulado por ítem ────────────────────────────────
+    const avances = await AvanceObra.findAll({ where: { obra_id: obraId }, attributes: ["id", "fecha_avance"] });
+    const idsAvance = avances.map((a) => a.id);
+    const avanceItems = idsAvance.length
+      ? await AvanceObraItem.findAll({ where: { avance_obra_id: { [Op.in]: idsAvance } } })
+      : [];
+
+    const ejecutado = new Map();
+    for (const i of avanceItems) {
+      const previo = ejecutado.get(i.pliego_item_id) || { porcentaje: 0, cantidad: 0 };
+      previo.porcentaje += aNumero(i.avance_porcentaje);
+      previo.cantidad += aNumero(i.cantidad_ejecutada);
+      ejecutado.set(i.pliego_item_id, previo);
+    }
+
+    // ── Certificado acumulado por ítem (sin las anuladas) ────────────────
+    const certificaciones = await Certificacion.findAll({
+      where: { obra_id: obraId },
+      attributes: ["id", "anulada", "fecha_certificacion"],
+    });
+    const idsCert = certificaciones.filter((c) => !c.anulada).map((c) => c.id);
+    const certItems = idsCert.length
+      ? await CertificacionItem.findAll({ where: { CertificacionId: { [Op.in]: idsCert } } })
+      : [];
+
+    const certificado = new Map();
+    for (const i of certItems) {
+      const previo = certificado.get(i.PliegoItemId) || { porcentaje: 0, importe: 0 };
+      previo.porcentaje += aNumero(i.avance_porcentaje);
+      previo.importe += aNumero(i.importe);
+      certificado.set(i.PliegoItemId, previo);
+    }
+
+    // ── Armar la respuesta ──────────────────────────────────────────────
+    const items = [];
+    const totales = vacio();
+
+    for (const p of pliego) {
+      const precio = aNumero(p.costoParcial);
+      const eje = ejecutado.get(p.id) || { porcentaje: 0, cantidad: 0 };
+      const cer = certificado.get(p.id) || { porcentaje: 0, importe: 0 };
+
+      // Lo ejecutado valorizado al precio del pliego. Para un ítem de
+      // excedente el precio todavía es 0, así que aporta cantidad pero no
+      // plata — que es exactamente lo que corresponde hasta que se negocie.
+      const ejecutadoImporte = r2((precio * Math.min(eje.porcentaje, 100)) / 100);
+
+      items.push({
+        pliego_item_id: p.id,
+        numero_item: p.numeroItem,
+        descripcion: p.descripcionItem,
+        unidad: p.unidadMedida || "",
+        origen: p.origen,
+        item_origen_id: p.item_origen_id ?? null,
+        // sin precio todavía: es un excedente esperando que lo negocien
+        sin_precio: precio === 0,
+
+        cantidad_pliego: r5(aNumero(p.cantidad)),
+        precio_contrato: r2(precio),
+
+        cantidad_ejecutada: r5(eje.cantidad),
+        avance_porcentaje: r2(eje.porcentaje),
+        // Lo ejecutado por encima del pliego NO se valoriza: no tiene precio.
+        excedente_cantidad: r5(Math.max(0, eje.cantidad - aNumero(p.cantidad))),
+        ejecutado_importe: ejecutadoImporte,
+
+        certificado_porcentaje: r2(cer.porcentaje),
+        certificado_importe: r2(cer.importe),
+
+        // La diferencia que le importa a la contabilidad.
+        diferencia: r2(ejecutadoImporte - cer.importe),
+      });
+
+      totales.precio_contrato += precio;
+      totales.ejecutado_importe += ejecutadoImporte;
+      totales.certificado_importe += cer.importe;
+      if (precio === 0) totales.items_sin_precio++;
+      if (eje.porcentaje > 100.01) totales.items_con_excedente++;
+    }
+
+    for (const k of ["precio_contrato", "ejecutado_importe", "certificado_importe"]) {
+      totales[k] = r2(totales[k]);
+    }
+    // El grado de avance de la obra: ejecutado sobre contratado, ponderado por
+    // el peso de cada ítem. Es el número que pide la RT 54.
+    totales.avance_porcentaje =
+      totales.precio_contrato > 0 ? r2((totales.ejecutado_importe / totales.precio_contrato) * 100) : 0;
+    totales.diferencia = r2(totales.ejecutado_importe - totales.certificado_importe);
+    totales.interpretacion =
+      totales.diferencia > 0
+        ? "Hay trabajo ejecutado que todavía no se certificó: es un activo (derechos a facturar)."
+        : totales.diferencia < 0
+        ? "Se certificó más de lo ejecutado: es un pasivo (cobrado por adelantado)."
+        : "Lo ejecutado y lo certificado coinciden.";
+
+    res.json({
+      obra: { id: obra.id, nombre: obra.nombre },
+      items,
+      totales,
+      ultimo_avance: avances.length
+        ? avances.map((a) => a.fecha_avance).sort().pop()
+        : null,
+      ultima_certificacion: certificaciones.length
+        ? certificaciones.map((c) => c.fecha_certificacion).sort().pop()
+        : null,
+    });
+  } catch (e) {
+    console.error("API pública / avance:", e);
+    res.status(500).json({ error: "Error al obtener el avance de la obra" });
+  }
+});
+
+function vacio() {
+  return {
+    precio_contrato: 0,
+    ejecutado_importe: 0,
+    certificado_importe: 0,
+    items_sin_precio: 0,
+    items_con_excedente: 0,
+    avance_porcentaje: 0,
+    diferencia: 0,
+  };
+}
+
+export default router;

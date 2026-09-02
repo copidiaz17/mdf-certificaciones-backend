@@ -195,15 +195,29 @@ router.get("/:obraId/excedentes", authMiddleware, async (req, res) => {
 
     const acumulado = await acumuladoPorItem(obraId);
 
+    // Lo que ya se convirtió en ítem nuevo se descuenta del pendiente. Un
+    // excedente puede reconocerse en partes —100 de 150 m3 en el replanteo de
+    // junio y el resto en un adicional al final— así que se suma por ítem origen.
+    const convertido = new Map();
+    for (const p of pliego) {
+      if (p.origen !== "excedente" || !p.item_origen_id) continue;
+      convertido.set(p.item_origen_id, aNumero(convertido.get(p.item_origen_id)) + aNumero(p.cantidad));
+    }
+
     const excedentes = [];
     let conAvance = 0;
     for (const p of pliego) {
+      // Un ítem que YA es un excedente convertido no genera excedente propio.
+      if (p.origen === "excedente") continue;
       const acu = acumulado.get(p.id);
       if (!acu) continue;
       conAvance++;
       if (acu.porcentaje <= 100 + TOLERANCIA) continue;
 
       const cantidadPliego = aNumero(p.cantidad);
+      const total = r5(Math.max(0, acu.cantidad - cantidadPliego));
+      const yaConvertido = r5(convertido.get(p.id) || 0);
+
       excedentes.push({
         pliego_item_id: p.id,
         numero_item: p.numeroItem,
@@ -214,7 +228,10 @@ router.get("/:obraId/excedentes", authMiddleware, async (req, res) => {
         cantidad_ejecutada: r5(acu.cantidad),
         // Lo que se hizo de más. SIN PRECIO a propósito: cuánto vale se define
         // en el replanteo, no lo decide quien carga el avance.
-        excedente: r5(Math.max(0, acu.cantidad - cantidadPliego)),
+        excedente: total,
+        // Lo que todavía no se reconoció en ningún ítem nuevo.
+        ya_convertido: yaConvertido,
+        pendiente: r5(Math.max(0, total - yaConvertido)),
         acumulado_porcentaje: r2(acu.porcentaje),
         excedente_porcentaje: r2(acu.porcentaje - 100),
       });
@@ -233,6 +250,111 @@ router.get("/:obraId/excedentes", authMiddleware, async (req, res) => {
     return res.status(500).json({ error: "Error al obtener los excedentes" });
   }
 });
+
+/**
+ * CONVERTIR UN EXCEDENTE EN ÍTEM DEL PLIEGO
+ * POST /avances-obra/:obraId/excedentes/:pliegoItemId/convertir
+ *
+ * Body: { cantidad, numero_item?, descripcion?, fecha? }
+ *
+ * El excedente NO se resuelve agrandándole la cantidad al ítem original: se
+ * crea un ítem NUEVO, sin precio. La razón es simple: cuánto vale lo ejecutado
+ * de más todavía no se sabe —se negocia en el replanteo o en un adicional— y
+ * meterlo dentro del ítem original mezclaría cantidad contratada con cantidad
+ * todavía sin precio.
+ *
+ * Se puede convertir en partes: si el comitente reconoce 100 de los 150 m3, se
+ * convierten 100 y quedan 50 pendientes esperando el adicional del final.
+ */
+router.post(
+  "/:obraId/excedentes/:pliegoItemId/convertir",
+  authMiddleware,
+  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
+  async (req, res) => {
+    const t = await sequelize.transaction();
+    try {
+      const { obraId, pliegoItemId } = req.params;
+      const cantidad = aNumero(req.body.cantidad);
+
+      const original = await PliegoItem.findOne({
+        where: { id: pliegoItemId, obraId },
+        transaction: t,
+      });
+      if (!original) {
+        await t.rollback();
+        return res.status(404).json({ message: "El ítem no pertenece al pliego de esta obra" });
+      }
+      if (original.origen === "excedente") {
+        await t.rollback();
+        return res.status(400).json({ message: "Ese ítem ya es un excedente convertido: no genera otro." });
+      }
+      if (!(cantidad > 0)) {
+        await t.rollback();
+        return res.status(400).json({ message: "Decí qué cantidad del excedente se reconoce." });
+      }
+
+      // Cuánto excedente hay, y cuánto queda sin convertir.
+      const acumulado = await acumuladoPorItem(obraId, t);
+      const acu = acumulado.get(original.id) || { porcentaje: 0, cantidad: 0 };
+      const cantidadPliego = aNumero(original.cantidad);
+      const total = Math.max(0, acu.cantidad - cantidadPliego);
+
+      const hermanos = await PliegoItem.findAll({
+        where: { obraId, origen: "excedente", item_origen_id: original.id },
+        transaction: t,
+      });
+      const yaConvertido = hermanos.reduce((s, h) => s + aNumero(h.cantidad), 0);
+      const pendiente = r5(total - yaConvertido);
+
+      if (cantidad > pendiente + 0.00001) {
+        await t.rollback();
+        return res.status(400).json({
+          message:
+            `No se puede reconocer ${r5(cantidad)} ${original.unidadMedida || ""}: ` +
+            `del excedente de ${r5(total)} quedan ${pendiente} sin convertir.`,
+        });
+      }
+
+      // El número lo hace reconocible de un vistazo en el listado del pliego.
+      const numero = String(req.body.numero_item || `${original.numeroItem} EXC`).trim();
+
+      const nuevo = await PliegoItem.create(
+        {
+          obraId: Number(obraId),
+          ItemGeneralId: original.ItemGeneralId,
+          numeroItem: numero,
+          descripcionItem: String(
+            req.body.descripcion || `${original.descripcionItem} — excedente`
+          ).trim(),
+          unidadMedida: original.unidadMedida,
+          cantidad,
+          // SIN PRECIO. Queda en cero a propósito hasta que se negocie: un
+          // precio inventado acá se convierte en un número que alguien después
+          // toma por bueno.
+          costoUnitario: 0,
+          costoParcial: 0,
+          origen: "excedente",
+          item_origen_id: original.id,
+          fecha_incorporacion: req.body.fecha || new Date().toISOString().slice(0, 10),
+        },
+        { transaction: t }
+      );
+
+      await t.commit();
+      return res.status(201).json({
+        message:
+          `Se creó el ítem ${numero} con ${r5(cantidad)} ${original.unidadMedida || ""}. ` +
+          `Queda SIN PRECIO hasta que se defina en el replanteo o el adicional.`,
+        item: nuevo,
+        pendiente_restante: r5(pendiente - cantidad),
+      });
+    } catch (error) {
+      await t.rollback();
+      console.error("Error convirtiendo el excedente:", error);
+      return res.status(500).json({ error: "Error al convertir el excedente" });
+    }
+  }
+);
 
 /**
  * CREAR AVANCE DE OBRA
