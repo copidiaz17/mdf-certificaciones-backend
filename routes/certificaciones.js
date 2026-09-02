@@ -11,6 +11,7 @@ import Usuario from "../models/Usuario.js";
 
 import { authMiddleware } from "./auth.js";
 import { hasRole, ROLES } from "../middlewares/authorization.js";
+import { avisarSinEsperar } from "../utils/avisarCostos.js";
 
 const router = express.Router();
 
@@ -302,6 +303,14 @@ router.post(
 
       await transaction.commit();
 
+      // El certificado ya existe: recién ahora se le avisa al sistema de
+      // costos, para que arme la factura con el importe, el período y el CUIT
+      // del receptor precargados. Va DESPUÉS del commit y sin esperar: si
+      // costos está caído, el certificado se emitió igual.
+      avisarSinEsperar({
+        obraId, evento: "certificado_emitido", certificadoId: certificacion.id,
+      });
+
       res.status(201).json({
         ok: true,
         certificacion_id: certificacion.id,
@@ -566,6 +575,10 @@ router.put(
       }
 
       await transaction.commit();
+      // Si cambió el importe, la factura pendiente del otro lado quedó vieja.
+      avisarSinEsperar({
+        obraId: cert.obra_id, evento: "certificado_editado", certificadoId: cert.id,
+      });
       return res.json({ ok: true, message: "Certificación actualizada correctamente." });
     } catch (error) {
       await transaction.rollback();
@@ -592,6 +605,11 @@ router.post(
       if (!cert) return res.status(404).json({ ok: false, error: "Certificación no encontrada." });
       if (cert.anulada) return res.status(400).json({ ok: false, error: "La certificación ya está anulada." });
       await cert.update({ anulada: true, anulada_por_id: req.user?.id || null });
+      // Sin este aviso, del otro lado quedaría una factura pendiente de un
+      // certificado que ya no existe.
+      avisarSinEsperar({
+        obraId: cert.obra_id, evento: "certificado_anulado", certificadoId: cert.id,
+      });
       return res.json({ ok: true, message: "Certificación anulada." });
     } catch (error) {
       console.error("Error anulando certificación:", error);
@@ -633,6 +651,9 @@ router.post(
 
       await cert.update({ anulada: false, anulada_por_id: null }, { transaction });
       await transaction.commit();
+      avisarSinEsperar({
+        obraId: cert.obra_id, evento: "certificado_reactivado", certificadoId: cert.id,
+      });
       return res.json({ ok: true, message: "Certificación reactivada." });
     } catch (error) {
       await transaction.rollback();

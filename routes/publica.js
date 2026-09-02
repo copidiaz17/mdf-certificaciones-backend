@@ -250,4 +250,52 @@ function vacio() {
   };
 }
 
+// ── GET /api/publica/obras/:obraId/certificados ──────────────────────────
+// Los certificados de una obra: lo que el sistema de costos necesita para
+// armar la factura sin que nadie vuelva a tipear los números.
+//
+// Van los TRES importes, porque son tres cosas distintas y confundirlas
+// factura mal:
+//   subtotal           lo certificado bruto
+//   deduccion_anticipo la devolución del anticipo financiero
+//   total_neto         lo que la obra termina cobrando
+//
+// El importe a facturar NO es ninguno de los tres: es subtotal menos la
+// devolución del anticipo. Ese cálculo lo hace costos, que es donde vive la
+// regla de cada repartición. Acá se mandan los insumos, no la conclusión.
+//
+// Las ANULADAS también van, marcadas: si un certificado se anula después de
+// que costos lo importó, el otro lado tiene que enterarse. Filtrarlas acá
+// dejaría del otro lado una factura pendiente de un certificado que ya no
+// existe.
+router.get("/obras/:obraId/certificados", async (req, res) => {
+  try {
+    const obra = await Obra.findByPk(req.params.obraId);
+    if (!obra) return res.status(404).json({ error: "La obra no existe" });
+
+    const certificaciones = await Certificacion.findAll({
+      where: { obra_id: obra.id },
+      order: [["fecha_certificacion", "ASC"], ["id", "ASC"]],
+    });
+
+    res.json({
+      obra: { id: obra.id, nombre: obra.nombre, reparticion: obra.reparticion ?? null },
+      certificados: certificaciones.map((c) => ({
+        id: c.id,
+        numero: String(c.numero_certificado),
+        fecha_certificacion: c.fecha_certificacion,
+        periodo_desde: c.periodo_desde,
+        periodo_hasta: c.periodo_hasta,
+        subtotal: r2(c.subtotal),
+        deduccion_anticipo: r2(c.deduccion_anticipo),
+        total_neto: r2(c.total_neto),
+        anulada: Boolean(c.anulada),
+      })),
+    });
+  } catch (e) {
+    console.error("API pública / certificados:", e);
+    res.status(500).json({ error: "Error al obtener los certificados" });
+  }
+});
+
 export default router;
