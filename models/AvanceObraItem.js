@@ -20,11 +20,25 @@ const AvanceObraItem = sequelize.define(
       allowNull: false,
     },
 
-    // ✅ NUEVO: porcentaje de avance del ítem para ESTE avance
+    // Porcentaje de avance del ítem para ESTE avance.
+    // PUEDE SUPERAR 100: el avance de obra registra lo que se ejecutó de
+    // verdad, no lo que estaba presupuestado. La certificación sí está topada.
     avance_porcentaje: {
-      type: DataTypes.DECIMAL(7, 2),
+      type: DataTypes.DECIMAL(9, 2),
       allowNull: false,
       defaultValue: 0,
+    },
+
+    // La cantidad realmente ejecutada en este avance, en la unidad del ítem
+    // (m3, m2, un...). Es la fuente de verdad cuando está cargada: el
+    // porcentaje se deriva de acá.
+    //
+    // Por qué hace falta además del porcentaje: el excedente se discute en
+    // obra en metros cúbicos, no en porcentaje. "150 m3 de excavación de más"
+    // se entiende; "400% de avance" no le dice nada a nadie.
+    cantidad_ejecutada: {
+      type: DataTypes.DECIMAL(15, 5),
+      allowNull: true,
     },
 
     // ⚠️ LEGADO (si todavía existen en la tabla)

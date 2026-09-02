@@ -66,6 +66,20 @@ export async function migrar({ silencioso = false } = {}) {
   await ajustarColumna("avance_obra_items", "precio_unitario", "DECIMAL(12,2) NULL DEFAULT NULL", log);
   await ajustarColumna("avance_obra_items", "importe", "DECIMAL(14,2) NULL DEFAULT NULL", log);
 
+  // ── Excedentes de obra ────────────────────────────────────────
+  // El avance de obra puede superar lo del pliego y la certificación no.
+  // Ejemplo real: 50 m3 de excavación presupuestados y 200 ejecutados. Eso
+  // existe, hay que registrarlo, y después se negocia en un replanteo.
+  //
+  // Hasta ahora el avance se guardaba SOLO en porcentaje y además se truncaba
+  // a 100 en silencio, así que ese dato se perdía. Con la cantidad ejecutada
+  // el excedente se puede expresar donde tiene sentido: en m3, no en "400%".
+  //
+  // `avance_porcentaje` pasa a DECIMAL(9,2) para que entre un acumulado alto
+  // sin desbordar (7,2 topaba en 99.999,99).
+  await agregarColumna("avance_obra_items", "cantidad_ejecutada", "DECIMAL(15,5) NULL DEFAULT NULL", log);
+  await ajustarColumna("avance_obra_items", "avance_porcentaje", "DECIMAL(9,2) NOT NULL DEFAULT 0", log);
+
   // ── certificaciones: auditoría y anulación (propio de MDF) ───────────────
   // Estaba suelto en el arranque de server.js; se centraliza acá.
   await agregarColumna("certificaciones", "creado_por_id", "INT NULL DEFAULT NULL", log);
