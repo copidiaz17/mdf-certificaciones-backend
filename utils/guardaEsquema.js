@@ -29,7 +29,11 @@ const HOSTS_LOCALES = ["localhost", "127.0.0.1", "::1", "host.docker.internal"];
 
 export function esBaseLocal(host = process.env.DB_HOST) {
   const h = String(host || "").trim().toLowerCase();
-  if (!h) return true; // sin host configurado, sequelize usa localhost
+  // Sin host, NO se asume local. Es cierto que sequelize usaria localhost,
+  // pero el caso real en que esto pasa es otro: que se consulte el freno antes
+  // de que dotenv haya cargado el .env. Ahi la base ES remota y el freno no lo
+  // sabe. No saber contra que base se esta no puede significar que si.
+  if (!h) return false;
   return HOSTS_LOCALES.includes(h);
 }
 
@@ -52,7 +56,8 @@ export function puedeTocarEsquema() {
   return {
     permitido: false,
     motivo:
-      `La base (${process.env.DB_HOST}) NO es local y MIGRAR_EN_ARRANQUE no está en "true". ` +
+      `La base (${process.env.DB_HOST || "sin DB_HOST definido"}) no es local, o no se pudo ` +
+      `saber cual es, y MIGRAR_EN_ARRANQUE no está en "true". ` +
       `El servidor va a atender normalmente pero NO va a tocar el esquema: sincronizar tablas ` +
       `o migrar contra una base remota desde una máquina de desarrollo es la forma más fácil ` +
       `de romper producción sin querer. Si esto ES el servidor de producción, poné ` +

@@ -56,6 +56,11 @@ import Obra from "../models/Obra.js";
 
 const router = express.Router();
 
+// Si este sistema permite anular certificados. MDF si, Falube todavia no.
+// Cuando Falube lo agregue, esto lo detecta solo.
+const TIENE_ANULADA = Boolean(Certificacion.rawAttributes?.anulada);
+
+
 const aNumero = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
@@ -133,7 +138,10 @@ router.get("/obras/:obraId/avance", async (req, res) => {
     // ── Certificado acumulado por ítem (sin las anuladas) ────────────────
     const certificaciones = await Certificacion.findAll({
       where: { obra_id: obraId },
-      attributes: ["id", "anulada", "fecha_certificacion"],
+      // Se pregunta al modelo en vez de asumir: el sistema de Falube todavia
+      // no permite anular un certificado y no tiene la columna. Pedirla igual
+      // fallaria con "Unknown column 'anulada'".
+      attributes: ["id", "fecha_certificacion", ...(TIENE_ANULADA ? ["anulada"] : [])],
     });
     const idsCert = certificaciones.filter((c) => !c.anulada).map((c) => c.id);
     const certItems = idsCert.length
