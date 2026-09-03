@@ -8,6 +8,7 @@ dotenv.config();
 // Importación de la conexión a la DB
 import { sequelize } from "./database.js";
 import { migrar } from "./migraciones.mjs";
+import { avisarEnConsola } from "./utils/guardaEsquema.js";
 
 // ===============================================
 // 1. IMPORTAR MODELOS (SOLO BACKEND)
@@ -132,17 +133,24 @@ console.log("🔄 Intentando conectar a la base de datos...");
 
 sequelize
   .authenticate()
-  .then(() => {
-    console.log("✅ Conexión a la base de datos OK");
-    return sequelize.sync();
-  })
   .then(async () => {
+    console.log("✅ Conexión a la base de datos OK");
+
+    // Sincronizar y migrar CAMBIAN el esquema. Contra una base remota desde
+    // una máquina de desarrollo eso es la forma más fácil de romper
+    // producción sin querer, y ya pasó una vez. El servidor atiende igual;
+    // lo único que no hace es tocar la estructura.
+    const guarda = avisarEnConsola();
+    if (!guarda.permitido) return;
+
+    await sequelize.sync();
     console.log("✅ Tablas sincronizadas");
 
     // El esquema se define en un solo lugar: migraciones.mjs.
     // Si algo falla, el arranque se corta en vez de levantar con la base vieja.
     await migrar();
-
+  })
+  .then(() => {
     app.listen(PORT, () => {
       console.log(`✅ Servidor corriendo en puerto ${PORT}`);
     });
