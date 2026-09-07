@@ -14,6 +14,7 @@ import AvanceObraItem from "./AvanceObraItem.js";
 import Subcontrato from "./Subcontrato.js";
 import SubcontratoItem from "./SubcontratoItem.js";
 import InformeAvance from "./InformeAvance.js";
+import FotoInforme from "./FotoInforme.js";
 
 /* ======================================================
    🔹 OBRAS Y PLIEGO
@@ -180,5 +181,10 @@ InformeAvance.belongsTo(Obra, { foreignKey: "obra_id", as: "obra" });
 // Quién lo firmó. En un informe de obra importa más que en cualquier otra
 // pantalla: es el que se le entrega al comitente.
 InformeAvance.belongsTo(Usuario, { foreignKey: "creado_por_id", as: "autor" });
+
+// Las fotos que respaldan el informe.
+InformeAvance.hasMany(FotoInforme, { foreignKey: "informe_id", as: "fotos" });
+FotoInforme.belongsTo(InformeAvance, { foreignKey: "informe_id", as: "informe" });
+FotoInforme.belongsTo(Usuario, { foreignKey: "subido_por_id", as: "subidaPor" });
 
 console.log("✅ Asociaciones Sequelize definidas correctamente");

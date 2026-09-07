@@ -9,6 +9,7 @@
 
 import express from "express";
 import { Op } from "sequelize";
+import multer from "multer";
 import { sequelize } from "../database.js";
 
 import Obra from "../models/Obra.js";
@@ -16,12 +17,31 @@ import PliegoItem from "../models/PliegoItem.js";
 import AvanceObra from "../models/AvanceObra.js";
 import AvanceObraItem from "../models/AvanceObraItem.js";
 import InformeAvance from "../models/InformeAvance.js";
+import FotoInforme from "../models/FotoInforme.js";
 import Usuario from "../models/Usuario.js";
 
 import { authMiddleware } from "./auth.js";
 import { hasRole, ROLES } from "../middlewares/authorization.js";
+import {
+  subirFoto, borrarFoto, miniatura, cloudinaryConfigurado,
+} from "../utils/fotosInforme.js";
 
 const router = express.Router();
+
+// El archivo no toca el disco: va a memoria y de ahí a Cloudinary. En Render
+// el disco se borra en cada despliegue, así que una foto guardada ahí
+// desaparece sola.
+const MAX_FOTOS = 20;
+const subida = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 12 * 1024 * 1024, files: MAX_FOTOS },
+  fileFilter: (req, file, cb) => {
+    if (!/^image\//.test(file.mimetype)) {
+      return cb(new Error("Solo se pueden subir imágenes."));
+    }
+    cb(null, true);
+  },
+});
 
 const n = (v) => {
   const x = Number(v);
@@ -297,9 +317,25 @@ router.get(
     try {
       const informe = await InformeAvance.findOne({
         where: { id: req.params.informeId, obra_id: req.params.obraId },
-        include: [{ model: Usuario, as: "autor", attributes: ["id", "nombre"] }],
+        include: [
+          { model: Usuario, as: "autor", attributes: ["id", "nombre"] },
+          {
+            model: FotoInforme,
+            as: "fotos",
+            include: [{ model: Usuario, as: "subidaPor", attributes: ["id", "nombre"] }],
+          },
+        ],
+        order: [[{ model: FotoInforme, as: "fotos" }, "orden", "ASC"]],
       });
       if (!informe) return res.status(404).json({ message: "Informe no encontrado" });
+
+      // La miniatura se arma acá y no en la pantalla: es una transformación de
+      // Cloudinary metida en la URL, y si esa regla vive en el frontend hay
+      // que repetirla en cada lugar que muestre una foto.
+      const fotos = (informe.fotos || []).map((f) => ({
+        ...f.toJSON(),
+        miniatura: miniatura(f.url),
+      }));
 
       let datos = null;
       try {
@@ -329,11 +365,175 @@ router.get(
         observaciones: informe.observaciones,
         autor: informe.autor,
         creado_en: informe.createdAt,
+        fotos,
         datos,
       });
     } catch (e) {
       console.error("Error obteniendo el informe:", e);
       return res.status(500).json({ message: "Error al obtener el informe" });
+    }
+  }
+);
+
+/* ==========================================================
+   SUBIR FOTOS A UN INFORME
+   POST /api/obras/:obraId/informes-avance/:informeId/fotos
+
+   Multipart: campo `fotos` (varias), y `epigrafes` con el texto de cada una
+   en el mismo orden.
+
+   Las fotos se pueden agregar DESPUÉS de guardado el informe. No contradice
+   que el informe esté congelado: los números son los que se entregaron, y la
+   foto es evidencia adjunta, con su propia fecha de subida.
+   ========================================================== */
+router.post(
+  "/:obraId/informes-avance/:informeId/fotos",
+  authMiddleware,
+  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
+  subida.array("fotos", MAX_FOTOS),
+  async (req, res) => {
+    // Se comprueba ANTES de aceptar nada: si no hay dónde guardarlas, decirlo
+    // es mejor que aceptar la subida y perderla.
+    if (!cloudinaryConfigurado()) {
+      return res.status(503).json({
+        message:
+          "Las fotos no están habilitadas en este servidor: faltan las " +
+          "credenciales de Cloudinary (CLOUDINARY_CLOUD_NAME, _API_KEY, _API_SECRET).",
+      });
+    }
+
+    const archivos = req.files || [];
+    if (archivos.length === 0) {
+      return res.status(400).json({ message: "No llegó ninguna foto." });
+    }
+
+    const informe = await InformeAvance.findOne({
+      where: { id: req.params.informeId, obra_id: req.params.obraId },
+    });
+    if (!informe) return res.status(404).json({ message: "Informe no encontrado" });
+
+    const yaTiene = await FotoInforme.count({ where: { informe_id: informe.id } });
+    if (yaTiene + archivos.length > MAX_FOTOS) {
+      return res.status(400).json({
+        message:
+          `Este informe ya tiene ${yaTiene} foto(s) y el máximo son ${MAX_FOTOS}. ` +
+          "Si hacen falta más, conviene partirlo en dos informes por frente de obra.",
+      });
+    }
+
+    // Los epígrafes llegan como campo repetido; con uno solo, multer da un
+    // string en vez de un array.
+    const epigrafes = [].concat(req.body?.epigrafes || []);
+
+    // Se sube todo a Cloudinary primero. Si algo falla en la base, se borra lo
+    // ya subido: al revés quedarían archivos huérfanos que nadie limpia.
+    const subidas = [];
+    try {
+      for (const a of archivos) {
+        subidas.push({ ...(await subirFoto(a.buffer, a.originalname)), nombre: a.originalname });
+      }
+    } catch (e) {
+      for (const s of subidas) await borrarFoto(s.public_id);
+      console.error("Error subiendo las fotos:", e);
+      return res.status(500).json({ message: "No se pudieron subir las fotos." });
+    }
+
+    const t = await sequelize.transaction();
+    try {
+      const creadas = [];
+      for (let i = 0; i < subidas.length; i++) {
+        creadas.push(
+          await FotoInforme.create(
+            {
+              informe_id: informe.id,
+              url: subidas[i].url,
+              public_id: subidas[i].public_id,
+              nombre_archivo: subidas[i].nombre,
+              epigrafe: String(epigrafes[i] || "").trim() || null,
+              orden: yaTiene + i,
+              subido_por_id: req.user?.id || null,
+            },
+            { transaction: t }
+          )
+        );
+      }
+      await t.commit();
+
+      const sinEpigrafe = creadas.filter((f) => !f.epigrafe).length;
+      return res.status(201).json({
+        ok: true,
+        fotos: creadas.map((f) => ({ ...f.toJSON(), miniatura: miniatura(f.url) })),
+        message:
+          `Se subieron ${creadas.length} foto(s).` +
+          (sinEpigrafe
+            ? ` ${sinEpigrafe} quedaron sin epígrafe: dentro de seis meses una foto sin texto es un muro que nadie sabe cuál es.`
+            : ""),
+      });
+    } catch (e) {
+      await t.rollback();
+      for (const s of subidas) await borrarFoto(s.public_id);
+      console.error("Error guardando las fotos:", e);
+      return res.status(500).json({ message: "No se pudieron guardar las fotos." });
+    }
+  }
+);
+
+/* ==========================================================
+   CAMBIAR EL EPÍGRAFE DE UNA FOTO
+   PUT /api/obras/:obraId/informes-avance/:informeId/fotos/:fotoId
+   ========================================================== */
+router.put(
+  "/:obraId/informes-avance/:informeId/fotos/:fotoId",
+  authMiddleware,
+  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
+  async (req, res) => {
+    try {
+      const foto = await FotoInforme.findOne({
+        where: { id: req.params.fotoId, informe_id: req.params.informeId },
+      });
+      if (!foto) return res.status(404).json({ message: "Foto no encontrada" });
+
+      const cambios = {};
+      if (req.body?.epigrafe !== undefined) {
+        cambios.epigrafe = String(req.body.epigrafe).trim() || null;
+      }
+      if (req.body?.orden !== undefined) cambios.orden = Number(req.body.orden) || 0;
+
+      await foto.update(cambios);
+      return res.json({ ok: true, foto });
+    } catch (e) {
+      console.error("Error editando la foto:", e);
+      return res.status(500).json({ message: "Error al editar la foto" });
+    }
+  }
+);
+
+/* ==========================================================
+   BORRAR UNA FOTO
+   DELETE /api/obras/:obraId/informes-avance/:informeId/fotos/:fotoId
+   ========================================================== */
+router.delete(
+  "/:obraId/informes-avance/:informeId/fotos/:fotoId",
+  authMiddleware,
+  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
+  async (req, res) => {
+    try {
+      const foto = await FotoInforme.findOne({
+        where: { id: req.params.fotoId, informe_id: req.params.informeId },
+      });
+      if (!foto) return res.status(404).json({ message: "Foto no encontrada" });
+
+      const publicId = foto.public_id;
+      await foto.destroy();
+      // Recién después de que la fila se fue: si Cloudinary falla, la foto
+      // queda huérfana allá, que es preferible a una fila que apunta a un
+      // archivo que ya no existe.
+      await borrarFoto(publicId);
+
+      return res.json({ ok: true, message: "Foto eliminada." });
+    } catch (e) {
+      console.error("Error borrando la foto:", e);
+      return res.status(500).json({ message: "Error al borrar la foto" });
     }
   }
 );
@@ -356,8 +556,18 @@ router.delete(
         where: { id: req.params.informeId, obra_id: req.params.obraId },
       });
       if (!informe) return res.status(404).json({ message: "Informe no encontrado" });
+
+      // Las fotos se van con él: si quedaran, serían archivos en Cloudinary
+      // que nadie va a poder relacionar con nada.
+      const fotos = await FotoInforme.findAll({ where: { informe_id: informe.id } });
+      await FotoInforme.destroy({ where: { informe_id: informe.id } });
       await informe.destroy();
-      return res.json({ ok: true, message: "Informe eliminado." });
+      for (const f of fotos) await borrarFoto(f.public_id);
+
+      return res.json({
+        ok: true,
+        message: `Informe eliminado${fotos.length ? ` y sus ${fotos.length} foto(s)` : ""}.`,
+      });
     } catch (e) {
       console.error("Error borrando el informe:", e);
       return res.status(500).json({ message: "Error al borrar el informe" });
