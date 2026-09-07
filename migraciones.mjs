@@ -80,7 +80,7 @@ export async function migrar({ silencioso = false } = {}) {
   await agregarColumna("avance_obra_items", "cantidad_ejecutada", "DECIMAL(15,5) NULL DEFAULT NULL", log);
   await ajustarColumna("avance_obra_items", "avance_porcentaje", "DECIMAL(9,2) NOT NULL DEFAULT 0", log);
 
-  // ── certificaciones: auditoría y anulación (propio de MDF) ───────────────
+  // ── certificaciones: auditoría y anulación ───────────────────────────────
   // Estaba suelto en el arranque de server.js; se centraliza acá.
   await agregarColumna("certificaciones", "creado_por_id", "INT NULL DEFAULT NULL", log);
   await agregarColumna("certificaciones", "editado_por_id", "INT NULL DEFAULT NULL", log);

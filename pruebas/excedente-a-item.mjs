@@ -1,11 +1,17 @@
 // Convertir un excedente en item del pliego, y la API entre sistemas.
 // Corre SOLO contra la base local de prueba. Deja todo como estaba.
-import { sequelize } from "file:///C:/certificacion-mdf/mdf-backend/database.js";
-import jwt from "file:///C:/certificacion-mdf/mdf-backend/node_modules/jsonwebtoken/index.js";
+import { sequelize } from "../database.js";
+import jwt from "jsonwebtoken";
 import fs from "fs";
 
+import { fileURLToPath } from "url";
+import * as _path from "path";
+// Relativo a ESTE archivo, no a una ruta escrita a mano: la misma prueba
+// tiene que poder correr en los dos sistemas.
+const _RAIZ = _path.join(_path.dirname(fileURLToPath(import.meta.url)), "..");
+
 const API = process.env.API_BASE || "http://localhost:3080/api";
-const SECRET = fs.readFileSync("C:/certificacion-mdf/mdf-backend/.env", "utf8").match(/^JWT_SECRET=(.*)$/m)[1].trim();
+const SECRET = fs.readFileSync(_path.join(_RAIZ, ".env"), "utf8").match(/^JWT_SECRET=(.*)$/m)[1].trim();
 const TK = jwt.sign({ id: 1, email: "t@t.com", nombre: "T", rol: "admin" }, SECRET, { expiresIn: "1h" });
 const TOKEN_API = process.env.API_TOKEN || "prueba-token";
 

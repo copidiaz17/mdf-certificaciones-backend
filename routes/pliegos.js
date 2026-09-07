@@ -15,9 +15,12 @@ router.post("/:obraId/pliego-item",
     hasRole([ROLES.ADMIN, ROLES.OPERATOR]), 
     async (req, res) => {
         const { obraId } = req.params;
-        const { ItemGeneralId, numeroItem, descripcionItem, unidadMedida, cantidad, costoUnitario, costoParcial } = req.body;
+        const { ItemGeneralId, numeroItem, descripcionItem, unidadMedida, cantidad, costoUnitario, costoParcial, origen, fecha_incorporacion } = req.body;
 
         try {
+            // El ítem maestro es obligatorio: el modelo no lo admite nulo. Se
+            // comprueba acá para devolver un mensaje que se entienda, en vez
+            // de dejar que falle en el insert con un error de la librería.
             const finalItemGeneralId = parseInt(ItemGeneralId);
 
             if (isNaN(finalItemGeneralId) || finalItemGeneralId === 0) {
@@ -32,6 +35,8 @@ router.post("/:obraId/pliego-item",
                 return res.status(400).json({ message: "La descripción del ítem es obligatoria." });
             }
 
+            const origenValido = ["original", "adicional"].includes(origen) ? origen : "original";
+
             const newItem = await PliegoItem.create({
                 obraId,
                 ItemGeneralId: finalItemGeneralId,
@@ -40,7 +45,9 @@ router.post("/:obraId/pliego-item",
                 unidadMedida,
                 cantidad,
                 costoUnitario,
-                costoParcial
+                costoParcial,
+                origen: origenValido,
+                fecha_incorporacion: origenValido === "adicional" ? (fecha_incorporacion || null) : null,
             });
             res.status(201).json(newItem);
         } catch (error) {
@@ -75,10 +82,11 @@ router.put("/:obraId/pliego-item/:itemId",
     hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
     async (req, res) => {
         const { itemId } = req.params;
-        const { numeroItem, descripcionItem, unidadMedida, cantidad, costoUnitario, costoParcial, ItemGeneralId } = req.body;
+        const { numeroItem, descripcionItem, unidadMedida, cantidad, costoUnitario, costoParcial, ItemGeneralId, origen, fecha_incorporacion } = req.body;
         try {
             const item = await PliegoItem.findByPk(itemId);
             if (!item) return res.status(404).json({ message: "Ítem no encontrado." });
+            const origenValido = ["original", "adicional"].includes(origen) ? origen : item.origen;
             await item.update({
                 numeroItem,
                 descripcionItem,
@@ -87,6 +95,8 @@ router.put("/:obraId/pliego-item/:itemId",
                 costoUnitario,
                 costoParcial,
                 ItemGeneralId: ItemGeneralId ? parseInt(ItemGeneralId) : item.ItemGeneralId,
+                origen: origenValido,
+                fecha_incorporacion: fecha_incorporacion !== undefined ? fecha_incorporacion : item.fecha_incorporacion,
             });
             res.json(item);
         } catch (error) {
