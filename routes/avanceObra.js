@@ -5,6 +5,8 @@ import { sequelize } from "../database.js";
 import AvanceObra from "../models/AvanceObra.js";
 import AvanceObraItem from "../models/AvanceObraItem.js";
 import PliegoItem from "../models/PliegoItem.js";
+import ItemGeneral from "../models/ItemGeneral.js";
+import Obra from "../models/Obra.js";
 
 import { authMiddleware } from "./auth.js";
 import { hasRole, ROLES } from "../middlewares/authorization.js";
@@ -38,6 +40,125 @@ const router = express.Router();
 // El excedente se registra en CANTIDAD y SIN PRECIO. Cuánto vale lo ejecutado
 // de más no lo decide quien carga el avance: se define después, en la
 // redeterminación o el replanteo, y recién ahí entra la plata.
+
+/**
+ * AGREGAR UN ÍTEM QUE APARECIÓ EN OBRA
+ * POST /avances-obra/:obraId/items
+ *
+ * Body: { descripcion, unidad, cantidad?, numero_item? }
+ *
+ * En obra aparece trabajo que el pliego no tiene. Hasta ahora el jefe de obra
+ * tenía que salir de la pantalla de avance, ir al pliego, cargarlo, y volver
+ * — y si no volvía, ese trabajo no quedaba registrado en ningún lado.
+ *
+ * ── Por qué SIN PRECIO ───────────────────────────────────────────────────
+ *
+ * Un ítem que no está en el pliego es trabajo NO CONTRATADO. Ponerle precio
+ * acá sería inventar contrato: cuánto se paga se negocia con el comitente, en
+ * un adicional o en el replanteo, y no lo decide quien carga el avance.
+ *
+ * Entra igual que un excedente reconocido: con cantidad y sin plata. El
+ * sistema ya sabe tratarlos —aportan cantidad, no importe, y se cuentan en
+ * `items_sin_precio`— así que el porcentaje de avance de la obra no se
+ * distorsiona: un ítem que vale 0 suma 0 al contrato y 0 a lo ejecutado.
+ *
+ * Queda marcado `origen: adicional` con su fecha de incorporación, que es lo
+ * que después permite listarlos y llevarlos a negociar.
+ */
+router.post(
+  "/:obraId/items",
+  authMiddleware,
+  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
+  async (req, res) => {
+    const t = await sequelize.transaction();
+    try {
+      const { obraId } = req.params;
+      const descripcion = String(req.body.descripcion || "").trim();
+      const unidad = String(req.body.unidad || "").trim();
+      const cantidad = aNumero(req.body.cantidad);
+
+      const obra = await Obra.findByPk(obraId, { transaction: t });
+      if (!obra) {
+        await t.rollback();
+        return res.status(404).json({ message: "Obra no encontrada" });
+      }
+      if (!descripcion) {
+        await t.rollback();
+        return res.status(400).json({ message: "Decí qué trabajo es: la descripción es obligatoria." });
+      }
+      if (!unidad) {
+        await t.rollback();
+        return res.status(400).json({
+          message: "Falta la unidad de medida. Sin ella no se puede cargar una cantidad ejecutada.",
+        });
+      }
+
+      // El catálogo general es un diccionario de tipos de trabajo. Si aparece
+      // uno que no está, se agrega: es exactamente para lo que existe.
+      const [general] = await ItemGeneral.findOrCreate({
+        where: { nombre: descripcion },
+        defaults: { nombre: descripcion, unidadMedida: unidad },
+        transaction: t,
+      });
+
+      // El número: el que se pida, o el que sigue. Los del pliego suelen ser
+      // "1.1", "2.3"; estos llevan A de adicional para que se distingan de un
+      // vistazo en cualquier listado.
+      let numero = String(req.body.numero_item || "").trim();
+      if (!numero) {
+        const cuantos = await PliegoItem.count({
+          where: { obraId, origen: "adicional" },
+          transaction: t,
+        });
+        numero = `A${cuantos + 1}`;
+      }
+
+      const yaEsta = await PliegoItem.findOne({
+        where: { obraId, numeroItem: numero },
+        transaction: t,
+      });
+      if (yaEsta) {
+        await t.rollback();
+        return res.status(400).json({
+          message: `Ya hay un ítem ${numero} en el pliego de esta obra.`,
+        });
+      }
+
+      const item = await PliegoItem.create(
+        {
+          obraId: Number(obraId),
+          ItemGeneralId: general.id,
+          numeroItem: numero,
+          descripcionItem: descripcion,
+          unidadMedida: unidad,
+          // La cantidad es una estimación de lo que se va a ejecutar; sirve
+          // para que el porcentaje signifique algo. Si no se sabe, queda en 0
+          // y el avance se carga en cantidad, que es lo que importa.
+          cantidad: cantidad > 0 ? cantidad : 0,
+          // SIN PRECIO, a propósito. Ver el comentario de arriba.
+          costoUnitario: 0,
+          costoParcial: 0,
+          origen: "adicional",
+          fecha_incorporacion: new Date().toISOString().slice(0, 10),
+        },
+        { transaction: t }
+      );
+
+      await t.commit();
+      return res.status(201).json({
+        ok: true,
+        item,
+        message:
+          `Se agregó el ítem ${numero} al pliego de la obra, SIN PRECIO. ` +
+          "Cuánto se paga se define con el comitente, en un adicional o en el replanteo.",
+      });
+    } catch (error) {
+      await t.rollback();
+      console.error("Error agregando el ítem a la obra:", error);
+      return res.status(500).json({ error: "Error al agregar el ítem" });
+    }
+  }
+);
 
 /**
  * PREVISUALIZAR — qué avisos saldrían, sin guardar nada.

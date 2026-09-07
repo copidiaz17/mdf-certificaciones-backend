@@ -187,6 +187,55 @@ try {
   check("lo guarda", r.status === 201, `→ ${r.status}`);
   check("y avisa que no hubo movimiento", /no hubo avances/i.test(r.data?.message || ""), `→ ${r.data?.message}`);
 
+  console.log("\n=== Un trabajo que el pliego NO tiene ===");
+  // Aparece en obra algo que no estaba contratado. Antes habia que salir de la
+  // pantalla, ir al pliego y volver — y si no se volvia, no quedaba en ningun
+  // lado.
+  let ra = await req("POST", `/avanceObra/${obraId}/items`,
+    { descripcion: `Demolicion ${SUF}`, unidad: "m3", cantidad: 40 }, token);
+  check("lo agrega al pliego", ra.status === 201, `→ ${ra.status} ${ra.data?.message}`);
+  const itemNuevo = ra.data?.item;
+  check("SIN precio", Number(itemNuevo?.costoUnitario) === 0 && Number(itemNuevo?.costoParcial) === 0,
+    `→ ${itemNuevo?.costoUnitario}`);
+  check("marcado como adicional", itemNuevo?.origen === "adicional", `→ ${itemNuevo?.origen}`);
+  check("con fecha de incorporacion", !!itemNuevo?.fecha_incorporacion);
+  check("y numero automatico", /^A\d+$/.test(itemNuevo?.numeroItem || ""), `→ ${itemNuevo?.numeroItem}`);
+  check("el aviso dice que va sin precio", /sin precio/i.test(ra.data?.message || ""), `→ ${ra.data?.message}`);
+
+  console.log("\n=== Y se le puede cargar avance en el acto ===");
+  await cargarAvance(6, "2026-05-10", [{ pliego_item_id: itemNuevo.id, cantidad_ejecutada: 15 }]);
+  ra = await req("POST", `/obras/${obraId}/informes-avance/previsualizar`,
+    { fecha_desde: "2026-05-01", fecha_hasta: "2026-05-31" }, token);
+  const nvo = ra.data?.informe?.items?.find((x) => x.pliego_item_id === itemNuevo.id);
+  check("aparece en el informe", !!nvo);
+  check("con sus 15 m3", Math.abs(nvo?.cantidad_periodo - 15) < 0.001, `→ ${nvo?.cantidad_periodo}`);
+  check("marcado como adicional", nvo?.origen === "adicional", `→ ${nvo?.origen}`);
+
+  console.log("\n=== Sin precio NO ensucia el porcentaje de la obra ===");
+  // Es lo que hace que se pueda registrar sin mentir: un item que vale 0 suma
+  // 0 al contrato y 0 a lo ejecutado, asi que el avance de la obra no se mueve
+  // por haber cargado trabajo no contratado.
+  check("el precio de contrato no cambio",
+    Math.abs(ra.data?.informe?.totales?.precio_contrato - 1100000) < 1,
+    `→ ${ra.data?.informe?.totales?.precio_contrato}`);
+  check("y el avance del periodo es 0% aunque se ejecutaron 15 m3",
+    ra.data?.informe?.totales?.avance_periodo_porcentaje === 0,
+    `→ ${ra.data?.informe?.totales?.avance_periodo_porcentaje}`);
+
+  console.log("\n=== Lo que no deja al agregar ===");
+  ra = await req("POST", `/avanceObra/${obraId}/items`, { unidad: "m3" }, token);
+  check("sin descripcion", ra.status === 400, `→ ${ra.status}`);
+  ra = await req("POST", `/avanceObra/${obraId}/items`, { descripcion: "Algo" }, token);
+  check("sin unidad", ra.status === 400, `→ ${ra.status}`);
+  check("y explica por que hace falta", /unidad/i.test(ra.data?.message || ""), `→ ${ra.data?.message}`);
+  ra = await req("POST", `/avanceObra/${obraId}/items`,
+    { descripcion: "Otra", unidad: "m2", numero_item: itemNuevo.numeroItem }, token);
+  check("un numero repetido", ra.status === 400, `→ ${ra.status}`);
+  ra = await req("POST", `/avanceObra/999999/items`, { descripcion: "X", unidad: "m2" }, token);
+  check("una obra que no existe", ra.status === 404, `→ ${ra.status}`);
+  ra = await req("POST", `/avanceObra/${obraId}/items`, { descripcion: "Y", unidad: "m2" });
+  check("sin sesion", ra.status === 401 || ra.status === 403, `→ ${ra.status}`);
+
 } catch (e) {
   console.error("EXPLOTO:", e.message, e.stack?.split("\n")[1]); fail++;
 } finally {
@@ -199,7 +248,7 @@ try {
   }
   await sql(`DELETE FROM obras WHERE nombre LIKE '%${SUF}'`);
   await sql(`DELETE FROM usuarios WHERE email LIKE '%${SUF}%'`);
-  await sql(`DELETE FROM itemgenerals WHERE nombre LIKE '%${SUF}'`);
+  await sql(`DELETE FROM itemgenerals WHERE nombre LIKE '%${SUF}%'`);
   check("no quedo basura de prueba",
     Number((await sql(`SELECT COUNT(*) n FROM obras WHERE nombre LIKE '%${SUF}'`))[0].n) === 0);
   console.log(`\n${"=".repeat(52)}\n${ok} pasaron, ${fail} fallaron`);
