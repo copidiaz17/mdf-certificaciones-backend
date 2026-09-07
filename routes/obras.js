@@ -15,7 +15,7 @@ import AvanceObra from "../models/AvanceObra.js";
 import AvanceObraItem from "../models/AvanceObraItem.js";
 
 import { authMiddleware } from "./auth.js";
-import { hasRole, ROLES } from "../middlewares/authorization.js";
+import { hasRole, ROLES } from "../middlewares/authorization.js";
 import {
   normalizarItem, acumuladoPorItem, avisosDeExcedente, calcularExcedentes,
 } from "../utils/excedentes.js";
@@ -31,7 +31,7 @@ router.post(
   hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
   async (req, res) => {
     try {
-      const { nombre, ubicacion, reparticion } = req.body;
+      const { nombre, ubicacion, reparticion, solo_costo_total } = req.body;
       if (!nombre) return res.status(400).json({ message: "El nombre es obligatorio" });
 
       const reparticionesPermitidas = ["municipalidad_sgo", "direccion_arquitectura"];
@@ -39,9 +39,56 @@ router.post(
         return res.status(400).json({ message: "Repartición no válida" });
       }
 
-      const obra = await Obra.create({ nombre, ubicacion, reparticion: reparticion || null });
+      const obra = await Obra.create({
+        nombre,
+        ubicacion,
+        reparticion: reparticion || null,
+        solo_costo_total: Boolean(solo_costo_total),
+      });
       return res.status(201).json(obra);
     } catch (e) {
+      return res.status(500).json({ error: "Error interno" });
+    }
+  }
+);
+
+// ── EDITAR UNA OBRA ──────────────────────────────────────────────────────
+// PUT /api/obras/:obraId
+//
+// No existía: una obra creada con la repartición equivocada solo se podía
+// arreglar entrando a la base, y la repartición decide toda la fórmula
+// financiera del certificado.
+router.put(
+  "/:obraId",
+  authMiddleware,
+  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
+  async (req, res) => {
+    try {
+      const obra = await Obra.findByPk(req.params.obraId);
+      if (!obra) return res.status(404).json({ message: "Obra no encontrada" });
+
+      const { nombre, ubicacion, reparticion, solo_costo_total } = req.body;
+
+      if (nombre !== undefined && !String(nombre).trim()) {
+        return res.status(400).json({ message: "El nombre es obligatorio" });
+      }
+
+      const reparticionesPermitidas = ["municipalidad_sgo", "direccion_arquitectura"];
+      if (reparticion && !reparticionesPermitidas.includes(reparticion)) {
+        return res.status(400).json({ message: "Repartición no válida" });
+      }
+
+      // Solo se toca lo que viene: un PUT con dos campos no borra los otros.
+      const cambios = {};
+      if (nombre !== undefined) cambios.nombre = String(nombre).trim();
+      if (ubicacion !== undefined) cambios.ubicacion = ubicacion;
+      if (reparticion !== undefined) cambios.reparticion = reparticion || null;
+      if (solo_costo_total !== undefined) cambios.solo_costo_total = Boolean(solo_costo_total);
+
+      await obra.update(cambios);
+      return res.json(obra);
+    } catch (e) {
+      console.error("Error editando la obra:", e);
       return res.status(500).json({ error: "Error interno" });
     }
   }

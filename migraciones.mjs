@@ -87,6 +87,30 @@ export async function migrar({ silencioso = false } = {}) {
   await agregarColumna("certificaciones", "anulada", "TINYINT(1) NOT NULL DEFAULT 0", log);
   await agregarColumna("certificaciones", "anulada_por_id", "INT NULL DEFAULT NULL", log);
 
+  // ── obras: contratadas por un precio total ───────────────────────────────
+  // Reemplaza a una lista de números de obra escrita a mano en la pantalla.
+  // El número de obra es distinto en cada empresa, así que esa lista no se
+  // podía ni copiar de un sistema al otro.
+  await agregarColumna("obras", "solo_costo_total", "TINYINT(1) NOT NULL DEFAULT 0", log);
+
+  // La única obra que estaba en esa lista, marcada por NOMBRE y no por id:
+  // así esto corre en los dos sistemas y en el que no la tiene no hace nada.
+  // Y solo si todavía no hay ninguna marcada, para no pisar lo que alguien
+  // haya decidido después desde la pantalla.
+  if (await tablaExiste("obras")) {
+    const [yaMarcadas] = await sequelize.query(
+      "SELECT COUNT(*) n FROM obras WHERE solo_costo_total = 1"
+    );
+    if (Number(yaMarcadas[0].n) === 0) {
+      const [, meta] = await sequelize.query(
+        `UPDATE obras SET solo_costo_total = 1
+          WHERE REPLACE(LOWER(nombre), ' ', '') LIKE '%arcoiris%'`
+      );
+      const filas = meta?.affectedRows ?? 0;
+      if (filas) log(`   ✅ ${filas} obra(s) marcadas como "solo costo total"`);
+    }
+  }
+
   // ── pliegoitems: ítems adicionales ───────────────────────────────────────
   await agregarColumna("pliegoitems", "origen", "ENUM('original','adicional') NOT NULL DEFAULT 'original'", log);
   // ── Ítems nacidos de un excedente ──────────────────────────────────
