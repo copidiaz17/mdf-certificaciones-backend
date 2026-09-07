@@ -154,6 +154,16 @@ try {
       Number((await sql(`SELECT COUNT(*) n FROM fotos_informe WHERE id = ${sinT.id}`))[0].n) === 0);
   }
 
+  console.log("\n=== El listado dice cuantas fotos tiene cada informe ===");
+  // Sin esto habria que abrir uno por uno para saber a cual le falta el
+  // respaldo, que es justo lo que uno quiere ver de un vistazo.
+  r = await req("GET", `/obras/${obraId}/informes-avance`, null, token);
+  const enLista = (r.data || []).find((x) => x.id === informeId);
+  check("lo informa", enLista !== undefined && enLista.fotos !== undefined,
+    `→ ${JSON.stringify(enLista)}`);
+  check("con el numero correcto", enLista?.fotos === (HAY_CLOUDINARY ? 2 : 0),
+    `→ ${enLista?.fotos}`);
+
   console.log("\n=== Lo que no deja ===");
   r = await subirFotos(`/obras/${obraId}/informes-avance/${informeId}/fotos`, null, [{ nombre: "a.png" }]);
   check("sin sesion", r.status === 401 || r.status === 403, `→ ${r.status}`);

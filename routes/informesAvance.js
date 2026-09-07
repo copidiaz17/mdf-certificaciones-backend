@@ -297,7 +297,27 @@ router.get(
         include: [{ model: Usuario, as: "autor", attributes: ["id", "nombre"] }],
         order: [["fecha_hasta", "DESC"], ["id", "DESC"]],
       });
-      return res.json(informes);
+
+      // Cuántas fotos tiene cada uno. Se cuenta de una sola consulta y no
+      // trayendo las filas: en la lista solo hace falta el número, para poder
+      // ver de un vistazo a cuál le falta el respaldo.
+      const conteo = new Map();
+      if (informes.length) {
+        const filas = await FotoInforme.findAll({
+          attributes: [
+            "informe_id",
+            [sequelize.fn("COUNT", sequelize.col("id")), "cuantas"],
+          ],
+          where: { informe_id: informes.map((i) => i.id) },
+          group: ["informe_id"],
+          raw: true,
+        });
+        for (const f of filas) conteo.set(Number(f.informe_id), Number(f.cuantas));
+      }
+
+      return res.json(
+        informes.map((i) => ({ ...i.toJSON(), fotos: conteo.get(i.id) || 0 }))
+      );
     } catch (e) {
       console.error("Error listando informes:", e);
       return res.status(500).json({ message: "Error al listar los informes" });
