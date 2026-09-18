@@ -33,6 +33,7 @@ NODE_ENV=development DB_HOST=localhost DB_PORT=3306 \
 | Suite | Qué verifica |
 |---|---|
 | `replanteo.mjs` | El replanteo como versión del plan: disponible, curva, edición, borrado, ítems adicionales y la migración de los replanteos viejos |
+| `subcontratos.mjs` | El circuito del subcontratista (caso real de Loza): OC con ítems del pliego y propios, plan por período, certificados con anterior calculado y precio congelado, excedentes, adicionales y descuentos |
 | `excedentes.mjs` | El avance puede superar el pliego, avisa, y el excedente queda en cantidad |
 | `excedente-a-item.mjs` | Convertir el excedente en un ítem nuevo sin precio, y la API entre sistemas |
 | `avance-ruta-real.mjs` | La ruta que USA la aplicación (`POST /obras/:id/avances`), que es distinta de `/avanceObra` |

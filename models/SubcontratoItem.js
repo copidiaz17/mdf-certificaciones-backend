@@ -1,37 +1,53 @@
 import { DataTypes } from "sequelize";
 import { sequelize } from "../database.js";
 
-// Ítem del pliego que toma a cargo el subcontratista, con el precio negociado.
+// Ítem de la orden de compra del subcontratista.
 //
-// `precio_acordado` es lo que se le paga por el ítem TERMINADO (al 100%).
-// El pago de cada semana sale de ahí: precio_acordado × (% avanzado esa semana).
+// Normalmente sale del pliego de la obra (pliego_item_id), pero con cantidad y
+// precio PROPIOS del subcontrato: lo que se le paga al sub no es lo que la
+// obra cobra. También puede ser un ítem que el pliego no tiene (pliego_item_id
+// nulo), como "descarga de materiales".
 //
-// Ese precio es el negociado con el subcontratista y no tiene por qué coincidir
-// con el del pliego. La diferencia entre ambos NO es la utilidad: para saberla
-// habría que imputarle a cada ítem los materiales que se consumieron, y eso el
-// sistema hoy no lo tiene. Por eso no se calcula ni se muestra.
+// El precio de acá es el VIGENTE. Cada certificado guarda el precio con el que
+// se certificó: si el precio cambia, lo ya certificado no se re-valúa. En la
+// planilla de Excel pasaba lo contrario y el "anterior" dejaba de cerrar.
 const SubcontratoItem = sequelize.define(
   "SubcontratoItem",
   {
     id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
 
     subcontrato_id: { type: DataTypes.INTEGER, allowNull: false },
-    pliego_item_id: { type: DataTypes.INTEGER, allowNull: false },
 
-    precio_acordado: {
-      type: DataTypes.DECIMAL(15, 2),
+    // Nulo cuando el ítem no está en el pliego de la obra.
+    pliego_item_id: { type: DataTypes.INTEGER, allowNull: true },
+
+    numero: { type: DataTypes.STRING, allowNull: true },
+    descripcion: { type: DataTypes.STRING(600), allowNull: true },
+    unidad: { type: DataTypes.STRING(30), allowNull: true },
+
+    // Cantidad contratada, en la unidad del ítem.
+    cantidad: { type: DataTypes.DECIMAL(15, 4), allowNull: false, defaultValue: 0 },
+
+    precio_unitario: { type: DataTypes.DECIMAL(15, 2), allowNull: false, defaultValue: 0 },
+
+    // contrato  estaba en la OC original
+    // adicional se agregó después ("Adicional de excavación...")
+    origen: {
+      type: DataTypes.ENUM("contrato", "adicional"),
       allowNull: false,
-      defaultValue: 0,
+      defaultValue: "contrato",
     },
+
+    orden: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+
+    // ⚠️ LEGADO: el modelo anterior guardaba acá un precio "por el ítem
+    // terminado". Ya no se usa; queda en la tabla para no tener que borrarla.
+    precio_acordado: { type: DataTypes.DECIMAL(15, 2), allowNull: false, defaultValue: 0 },
   },
   {
     tableName: "subcontrato_items",
     freezeTableName: true,
     timestamps: false,
-    indexes: [
-      // Un ítem no puede estar dos veces en el mismo subcontrato.
-      { unique: true, fields: ["subcontrato_id", "pliego_item_id"] },
-    ],
   }
 );
 

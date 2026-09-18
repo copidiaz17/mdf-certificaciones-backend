@@ -1,404 +1,727 @@
+// routes/subcontratos.js
+//
+// CIRCUITO DEL SUBCONTRATISTA — aparte del de la obra.
+//
+//   GET    /obras/:obraId/subcontratos                         lista con estadísticas
+//   GET    /obras/:obraId/subcontratos-pliego                  pliego para armar la OC
+//   POST   /obras/:obraId/subcontratos                         crea la OC con sus ítems
+//   GET    /obras/:obraId/subcontratos/:subId                  detalle + estadísticas + curva
+//   PUT    /obras/:obraId/subcontratos/:subId                  edita la OC y sus ítems
+//   DELETE /obras/:obraId/subcontratos/:subId                  borra (si no tiene certificados)
+//   GET    /obras/:obraId/subcontratos/:subId/plan             plan de trabajo por período
+//   PUT    /obras/:obraId/subcontratos/:subId/plan             reemplaza el plan
+//   GET    /obras/:obraId/subcontratos/:subId/certificados/nuevo       planilla en blanco
+//   GET    /obras/:obraId/subcontratos/:subId/certificados/:certId     planilla de un certificado
+//   POST   /obras/:obraId/subcontratos/:subId/certificados             certifica un período
+//   PUT    /obras/:obraId/subcontratos/:subId/certificados/:certId     corrige el ÚLTIMO
+//   POST   /obras/:obraId/subcontratos/:subId/certificados/:certId/anular  anula el ÚLTIMO
+//
+// Antes el pago al sub salía del avance de obra de la empresa, con un único
+// precio "por el ítem terminado". Ahora tiene orden de compra propia, plan
+// propio y certificados propios, como en la planilla de Excel que se usa hoy.
 import express from "express";
-import { Op } from "sequelize";
 import { sequelize } from "../database.js";
 
 import Obra from "../models/Obra.js";
 import PliegoItem from "../models/PliegoItem.js";
 import Subcontrato from "../models/Subcontrato.js";
 import SubcontratoItem from "../models/SubcontratoItem.js";
-import AvanceObra from "../models/AvanceObra.js";
-import AvanceObraItem from "../models/AvanceObraItem.js";
+import { SubcontratoPlanPeriodo, SubcontratoPlanItem } from "../models/SubcontratoPlan.js";
+import {
+  SubcontratoCertificado, SubcontratoCertificadoItem, SubcontratoDescuento,
+} from "../models/SubcontratoCertificado.js";
 
 import { authMiddleware } from "./auth.js";
 import { hasRole, ROLES } from "../middlewares/authorization.js";
+import {
+  planillaDe, resumenSubcontrato, totalContrato, generarPeriodos, sugerirPeriodo,
+  esFecha, norm, r2, r4,
+} from "../utils/subcontratos.js";
 
 const router = express.Router();
 
+const LEER = hasRole([ROLES.ADMIN, ROLES.OPERATOR, ROLES.VIEWER]);
+const ESCRIBIR = hasRole([ROLES.ADMIN, ROLES.OPERATOR]);
+
 const ESTADOS = ["vigente", "finalizado", "anulado"];
+const PERIODICIDADES = ["quincenal", "semanal"];
+const TIPOS_DESCUENTO = ["adelanto", "herramientas", "otro"];
+const TOLERANCIA = 0.0001;
 
-// ── Quincenas ────────────────────────────────────────────────────────────
-// Al subcontratista se le certifica por quincena: del 1 al 15, y del 16 al
-// último día del mes. Como ninguna quincena cruza de mes, cada una cae entera
-// dentro de un mes de certificación: no hay períodos a caballo que repartir.
-const MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
-  "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
-
-const partes = (f) => {
-  if (!f) return null;
-  const [a, m, d] = String(f).slice(0, 10).split("-").map(Number);
-  return { anio: a, mes: m, dia: d };
+const hoyISO = () => {
+  const h = new Date();
+  return `${h.getFullYear()}-${String(h.getMonth() + 1).padStart(2, "0")}-${String(h.getDate()).padStart(2, "0")}`;
 };
 
-const ultimoDiaDelMes = (anio, mes) => new Date(anio, mes, 0).getDate();
+const agrupar = (filas, clave) => {
+  const out = {};
+  for (const f of filas) (out[f[clave]] ||= []).push(f);
+  return out;
+};
 
-// ¿El período es una quincena bien formada?
-function analizarQuincena(desde, hasta) {
-  const d = partes(desde);
-  const h = partes(hasta);
-  if (!d || !h) return { valida: false, numero: null, etiqueta: null, motivo: "faltan las fechas del período" };
-  if (d.anio !== h.anio || d.mes !== h.mes) {
-    return { valida: false, numero: null, etiqueta: null, motivo: "el período cruza de mes" };
-  }
+const porOrden = (a, b) =>
+  (a.origen === b.origen ? 0 : a.origen === "adicional" ? 1 : -1)
+  || (a.orden - b.orden)
+  || String(a.numero || "").localeCompare(String(b.numero || ""), "es", { numeric: true })
+  || (a.id - b.id);
 
-  const ultimo = ultimoDiaDelMes(d.anio, d.mes);
-  const nombreMes = `${MESES[d.mes - 1]} ${d.anio}`;
+/** Todo lo de un subcontrato, en filas planas. */
+async function cargar(obraId, subId, t) {
+  const sub = await Subcontrato.findOne({
+    where: { id: subId, obra_id: obraId }, transaction: t, ...(t ? { lock: t.LOCK.UPDATE } : {}),
+  });
+  if (!sub) return null;
 
-  if (d.dia === 1 && h.dia === 15) {
-    return { valida: true, numero: 1, etiqueta: `1ª quincena de ${nombreMes}`, motivo: null };
-  }
-  if (d.dia === 16 && h.dia === ultimo) {
-    return { valida: true, numero: 2, etiqueta: `2ª quincena de ${nombreMes}`, motivo: null };
-  }
+  const items = (await SubcontratoItem.findAll({ where: { subcontrato_id: sub.id }, raw: true, transaction: t })).sort(porOrden);
+  const todos = await SubcontratoCertificado.findAll({
+    where: { subcontrato_id: sub.id }, order: [["numero", "ASC"]], raw: true, transaction: t,
+  });
+  const vigentes = todos.filter((c) => !c.anulado);
+  const certIds = todos.map((c) => c.id);
+  const certItems = certIds.length
+    ? await SubcontratoCertificadoItem.findAll({ where: { certificado_id: certIds }, raw: true, transaction: t })
+    : [];
+  const descuentos = certIds.length
+    ? await SubcontratoDescuento.findAll({ where: { certificado_id: certIds }, raw: true, transaction: t })
+    : [];
+  const planPeriodos = await SubcontratoPlanPeriodo.findAll({
+    where: { subcontrato_id: sub.id }, order: [["numero", "ASC"]], raw: true, transaction: t,
+  });
+  const planItems = planPeriodos.length
+    ? await SubcontratoPlanItem.findAll({ where: { plan_periodo_id: planPeriodos.map((p) => p.id) }, raw: true, transaction: t })
+    : [];
 
-  const numero = d.dia <= 15 ? 1 : 2;
   return {
-    valida: false,
-    numero,
-    etiqueta: `${numero}ª quincena de ${nombreMes} (fechas irregulares)`,
-    motivo: `debería ir del ${numero === 1 ? "1 al 15" : `16 al ${ultimo}`}`,
+    sub,
+    items,
+    todos,
+    vigentes,
+    certItemsPorCert: agrupar(certItems, "certificado_id"),
+    descuentosPorCert: agrupar(descuentos, "certificado_id"),
+    planPeriodos,
+    planItemsPorPeriodo: agrupar(planItems, "plan_periodo_id"),
+  };
+}
+
+function resumenDe(d) {
+  return resumenSubcontrato({
+    items: d.items,
+    certificados: d.vigentes,
+    certItemsPorCert: d.certItemsPorCert,
+    descuentos: d.vigentes.flatMap((c) => d.descuentosPorCert[c.id] || []),
+    planPeriodos: d.planPeriodos,
+    planItemsPorPeriodo: d.planItemsPorPeriodo,
+    hoy: hoyISO(),
+  });
+}
+
+function datosCabecera(s) {
+  return {
+    id: s.id, obra_id: s.obra_id, subcontratista: s.subcontratista, cuit: s.cuit,
+    numero_oc: s.numero_oc, fecha_contrato: s.fecha_contrato, fecha_inicio: s.fecha_inicio,
+    periodicidad: s.periodicidad, estado: s.estado, observaciones: s.observaciones,
+  };
+}
+
+const itemsPlanos = (items) => items.map((it) => ({
+  ...it, cantidad: Number(it.cantidad), precio_unitario: Number(it.precio_unitario),
+}));
+
+/**
+ * Valida la cabecera y los ítems de una OC. Devuelve { error } o los datos listos.
+ * Los ítems del pliego se validan contra ESTA obra; los que no son del pliego
+ * necesitan descripción.
+ */
+async function validarOC({ obraId, body, t }) {
+  const subcontratista = String(body.subcontratista || "").trim();
+  if (!subcontratista) return { error: "Falta el nombre del subcontratista." };
+  const periodicidad = body.periodicidad || "quincenal";
+  if (!PERIODICIDADES.includes(periodicidad)) return { error: "La periodicidad tiene que ser quincenal o semanal." };
+  if (body.fecha_contrato && !esFecha(norm(body.fecha_contrato))) return { error: "La fecha de contrato no es válida." };
+  if (body.fecha_inicio && !esFecha(norm(body.fecha_inicio))) return { error: "La fecha de inicio no es válida." };
+  if (body.estado && !ESTADOS.includes(body.estado)) return { error: "Estado inválido." };
+
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) return { error: "La orden de compra tiene que tener al menos un ítem." };
+
+  const pliego = await PliegoItem.findAll({ where: { obraId }, raw: true, transaction: t });
+  const pliegoPorId = new Map(pliego.map((p) => [p.id, p]));
+  const vistos = new Set();
+  const limpios = [];
+
+  for (const [i, it] of items.entries()) {
+    const pliegoId = it.pliego_item_id ? Number(it.pliego_item_id) : null;
+    const del = pliegoId ? pliegoPorId.get(pliegoId) : null;
+    if (pliegoId && !del) return { error: "Hay ítems que no pertenecen al pliego de esta obra." };
+    if (pliegoId && vistos.has(pliegoId)) return { error: `El ítem ${del.numeroItem} del pliego está repetido en la OC.` };
+    if (pliegoId) vistos.add(pliegoId);
+
+    const descripcion = String(it.descripcion || del?.descripcionItem || "").trim();
+    if (!descripcion) return { error: "Un ítem propio necesita descripción." };
+    const cantidad = Number(it.cantidad);
+    const precio = Number(it.precio_unitario);
+    if (!Number.isFinite(cantidad) || cantidad <= 0) return { error: `El ítem "${descripcion}" necesita una cantidad mayor a 0.` };
+    if (!Number.isFinite(precio) || precio < 0) return { error: `El ítem "${descripcion}" tiene un precio inválido.` };
+
+    limpios.push({
+      id: it.id ? Number(it.id) : null,
+      pliego_item_id: pliegoId,
+      numero: String(it.numero || del?.numeroItem || "").trim() || null,
+      descripcion: descripcion.slice(0, 600),
+      unidad: String(it.unidad || del?.unidadMedida || "").trim().slice(0, 30) || null,
+      cantidad: r4(cantidad),
+      precio_unitario: r2(precio),
+      origen: it.origen === "adicional" ? "adicional" : "contrato",
+      orden: i,
+    });
+  }
+
+  return {
+    cabecera: {
+      subcontratista,
+      cuit: String(body.cuit || "").trim() || null,
+      numero_oc: String(body.numero_oc || "").trim() || null,
+      fecha_contrato: body.fecha_contrato ? norm(body.fecha_contrato) : null,
+      fecha_inicio: body.fecha_inicio ? norm(body.fecha_inicio) : null,
+      periodicidad,
+      observaciones: body.observaciones || null,
+      ...(body.estado ? { estado: body.estado } : {}),
+    },
+    items: limpios,
   };
 }
 
 /* ======================================================
-   LISTAR los subcontratos de una obra
+   LISTAR los subcontratos de una obra, con sus números
 ====================================================== */
-router.get(
-  "/:obraId/subcontratos",
-  authMiddleware,
-  hasRole([ROLES.ADMIN, ROLES.OPERATOR, ROLES.VIEWER]),
-  async (req, res) => {
-    try {
-      const subs = await Subcontrato.findAll({
-        where: { obra_id: req.params.obraId },
-        include: [{
-          model: SubcontratoItem, as: "items",
-          include: [{ model: PliegoItem, as: "pliegoItem", attributes: ["id", "numeroItem", "descripcionItem", "unidadMedida", "cantidad", "costoParcial"] }],
-        }],
-        order: [["id", "ASC"]],
-      });
-
-      const salida = subs.map((s) => {
-        const j = s.toJSON();
-        j.monto_contrato = Number(
-          (j.items || []).reduce((acc, i) => acc + Number(i.precio_acordado || 0), 0).toFixed(2)
-        );
-        return j;
-      });
-
-      return res.json(salida);
-    } catch (error) {
-      console.error("Error listando subcontratos:", error);
-      return res.status(500).json({ message: "Error al listar subcontratos" });
+router.get("/:obraId/subcontratos", authMiddleware, LEER, async (req, res) => {
+  try {
+    const { obraId } = req.params;
+    const subs = await Subcontrato.findAll({ where: { obra_id: obraId }, order: [["createdAt", "ASC"]] });
+    const lista = [];
+    for (const s of subs) {
+      const d = await cargar(obraId, s.id);
+      lista.push({ ...datosCabecera(s), items: d.items.length, totales: resumenDe(d).totales });
     }
+    return res.json(lista);
+  } catch (error) {
+    console.error("Error listando subcontratos:", error);
+    return res.status(500).json({ message: "Error al listar los subcontratos" });
   }
-);
+});
 
 /* ======================================================
-   ÍTEMS DEL PLIEGO disponibles para subcontratar
-   Marca los que ya están tomados por otro subcontrato de la obra.
+   PLIEGO de la obra, para armar la OC.
+   Marca en qué otros subcontratos está cada ítem.
 ====================================================== */
-router.get(
-  "/:obraId/subcontratos-items-disponibles",
-  authMiddleware,
-  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
-  async (req, res) => {
-    try {
-      const { obraId } = req.params;
-      const excluir = Number(req.query.excluir_subcontrato) || 0; // al editar, no contarse a sí mismo
-
-      const items = await PliegoItem.findAll({ where: { obraId }, order: [["numeroItem", "ASC"]] });
-
-      const subs = await Subcontrato.findAll({ where: { obra_id: obraId }, attributes: ["id", "subcontratista"], raw: true });
-      const subsPorId = Object.fromEntries(subs.map((s) => [s.id, s.subcontratista]));
-      const tomados = subs.length
-        ? await SubcontratoItem.findAll({ where: { subcontrato_id: subs.map((s) => s.id) }, raw: true })
-        : [];
-
-      const tomadoPor = {};
-      tomados.forEach((t) => {
-        if (t.subcontrato_id === excluir) return;
-        tomadoPor[t.pliego_item_id] = subsPorId[t.subcontrato_id];
-      });
-
-      return res.json(items.map((i) => ({
-        ...i.toJSON(),
-        tomado_por: tomadoPor[i.id] || null,
-      })));
-    } catch (error) {
-      console.error("Error ítems disponibles subcontrato:", error);
-      return res.status(500).json({ message: "Error al cargar los ítems del pliego" });
+router.get("/:obraId/subcontratos-pliego", authMiddleware, LEER, async (req, res) => {
+  try {
+    const { obraId } = req.params;
+    const pliego = (await PliegoItem.findAll({ where: { obraId }, raw: true }))
+      .sort((a, b) => String(a.numeroItem).localeCompare(String(b.numeroItem), "es", { numeric: true }));
+    const subs = await Subcontrato.findAll({ where: { obra_id: obraId, estado: ["vigente", "finalizado"] }, raw: true });
+    const usos = subs.length
+      ? await SubcontratoItem.findAll({ where: { subcontrato_id: subs.map((s) => s.id) }, raw: true })
+      : [];
+    const nombre = Object.fromEntries(subs.map((s) => [s.id, s.subcontratista]));
+    const enSubs = {};
+    for (const u of usos) {
+      if (!u.pliego_item_id) continue;
+      (enSubs[u.pliego_item_id] ||= []).push({ subcontrato_id: u.subcontrato_id, subcontratista: nombre[u.subcontrato_id] });
     }
+    return res.json(pliego.map((p) => ({
+      id: p.id, numeroItem: p.numeroItem, descripcionItem: p.descripcionItem, unidadMedida: p.unidadMedida,
+      cantidad: Number(p.cantidad || 0), origen: p.origen, en_subcontratos: enSubs[p.id] || [],
+    })));
+  } catch (error) {
+    console.error("Error pliego para subcontrato:", error);
+    return res.status(500).json({ message: "Error al cargar el pliego" });
   }
-);
+});
 
 /* ======================================================
-   CREAR un subcontrato con sus ítems
+   CREAR la orden de compra
 ====================================================== */
-router.post(
-  "/:obraId/subcontratos",
-  authMiddleware,
-  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
-  async (req, res) => {
-    const t = await sequelize.transaction();
-    try {
-      const { obraId } = req.params;
-      const { subcontratista, cuit, fecha_contrato, estado, observaciones, items } = req.body;
+router.post("/:obraId/subcontratos", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const { obraId } = req.params;
+    const obra = await Obra.findByPk(obraId, { transaction: t });
+    if (!obra) { await t.rollback(); return res.status(404).json({ message: "Obra no encontrada" }); }
 
-      if (!subcontratista || !String(subcontratista).trim()) {
-        await t.rollback();
-        return res.status(400).json({ message: "Falta el nombre del subcontratista" });
+    const datos = await validarOC({ obraId, body: req.body, t });
+    if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
+
+    const sub = await Subcontrato.create({ obra_id: Number(obraId), ...datos.cabecera }, { transaction: t });
+    await SubcontratoItem.bulkCreate(
+      datos.items.map(({ id, ...it }) => ({ ...it, subcontrato_id: sub.id })),
+      { transaction: t }
+    );
+    await t.commit();
+    return res.status(201).json({ ok: true, id: sub.id, message: "Subcontrato creado" });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error creando subcontrato:", error);
+    return res.status(500).json({ message: "Error al crear el subcontrato" });
+  }
+});
+
+/* ======================================================
+   DETALLE: OC, estadísticas, curva y certificados
+====================================================== */
+router.get("/:obraId/subcontratos/:subId", authMiddleware, LEER, async (req, res) => {
+  try {
+    const { obraId, subId } = req.params;
+    const d = await cargar(obraId, subId);
+    if (!d) return res.status(404).json({ message: "Subcontrato no encontrado" });
+
+    const certificados = d.todos.map((c) => {
+      if (c.anulado) return { ...c, importe: null, descuentos: null, a_pagar: null, avance_acumulado: null };
+      const p = planillaDe({
+        items: d.items, certificados: d.vigentes, certItemsPorCert: d.certItemsPorCert,
+        descuentos: d.descuentosPorCert[c.id] || [], certificado: c,
+      });
+      return {
+        ...c,
+        importe: p.totales.importe.actual,
+        descuentos: p.totales.descuentos,
+        a_pagar: p.totales.a_pagar,
+        avance_acumulado: p.totales.avance.acumulado,
+      };
+    });
+
+    return res.json({
+      subcontrato: datosCabecera(d.sub),
+      items: itemsPlanos(d.items),
+      resumen: resumenDe(d),
+      certificados,
+      ultimo_certificado_id: d.vigentes[d.vigentes.length - 1]?.id || null,
+      tiene_plan: d.planPeriodos.length > 0,
+    });
+  } catch (error) {
+    console.error("Error detalle subcontrato:", error);
+    return res.status(500).json({ message: "Error al cargar el subcontrato" });
+  }
+});
+
+/* ======================================================
+   EDITAR la OC y sus ítems
+   · Un ítem que ya tiene certificados no se puede sacar.
+   · Cambiar el precio vale para los certificados que vengan: lo ya
+     certificado conserva el precio con el que se certificó.
+====================================================== */
+router.put("/:obraId/subcontratos/:subId", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const { obraId, subId } = req.params;
+    const d = await cargar(obraId, subId, t);
+    if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
+
+    const datos = await validarOC({ obraId, body: req.body, t });
+    if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
+
+    const existentes = new Map(d.items.map((i) => [i.id, i]));
+    if (datos.items.some((i) => i.id && !existentes.has(i.id))) {
+      await t.rollback();
+      return res.status(400).json({ message: "Hay ítems que no son de este subcontrato." });
+    }
+
+    const conCertificado = new Set();
+    for (const c of d.todos) for (const ci of d.certItemsPorCert[c.id] || []) conCertificado.add(ci.subcontrato_item_id);
+
+    const quedan = new Set(datos.items.filter((i) => i.id).map((i) => i.id));
+    const aBorrar = d.items.filter((i) => !quedan.has(i.id));
+    const trabado = aBorrar.find((i) => conCertificado.has(i.id));
+    if (trabado) {
+      await t.rollback();
+      return res.status(400).json({ message: `No se puede sacar el ítem "${trabado.descripcion}": ya tiene cantidades certificadas.` });
+    }
+
+    await d.sub.update(datos.cabecera, { transaction: t });
+    if (aBorrar.length) {
+      const ids = aBorrar.map((i) => i.id);
+      await SubcontratoPlanItem.destroy({ where: { subcontrato_item_id: ids }, transaction: t });
+      await SubcontratoItem.destroy({ where: { id: ids }, transaction: t });
+    }
+    for (const it of datos.items) {
+      const { id, ...campos } = it;
+      if (id) await SubcontratoItem.update(campos, { where: { id }, transaction: t });
+      else await SubcontratoItem.create({ ...campos, subcontrato_id: d.sub.id }, { transaction: t });
+    }
+
+    await t.commit();
+    return res.json({ ok: true, message: "Subcontrato actualizado" });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error editando subcontrato:", error);
+    return res.status(500).json({ message: "Error al editar el subcontrato" });
+  }
+});
+
+/* ======================================================
+   BORRAR — solo si no tiene certificados vigentes
+====================================================== */
+router.delete("/:obraId/subcontratos/:subId", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const { obraId, subId } = req.params;
+    const d = await cargar(obraId, subId, t);
+    if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
+    if (d.vigentes.length) {
+      await t.rollback();
+      return res.status(400).json({ message: "El subcontrato tiene certificados. Para cerrarlo, cambiale el estado a finalizado o anulado." });
+    }
+    const certIds = d.todos.map((c) => c.id);
+    if (certIds.length) {
+      await SubcontratoDescuento.destroy({ where: { certificado_id: certIds }, transaction: t });
+      await SubcontratoCertificadoItem.destroy({ where: { certificado_id: certIds }, transaction: t });
+      await SubcontratoCertificado.destroy({ where: { id: certIds }, transaction: t });
+    }
+    const periodoIds = d.planPeriodos.map((p) => p.id);
+    if (periodoIds.length) {
+      await SubcontratoPlanItem.destroy({ where: { plan_periodo_id: periodoIds }, transaction: t });
+      await SubcontratoPlanPeriodo.destroy({ where: { id: periodoIds }, transaction: t });
+    }
+    await SubcontratoItem.destroy({ where: { subcontrato_id: d.sub.id }, transaction: t });
+    await d.sub.destroy({ transaction: t });
+    await t.commit();
+    return res.json({ ok: true, message: "Subcontrato borrado" });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error borrando subcontrato:", error);
+    return res.status(500).json({ message: "Error al borrar el subcontrato" });
+  }
+});
+
+/* ======================================================
+   PLAN DE TRABAJO por período
+====================================================== */
+router.get("/:obraId/subcontratos/:subId/plan", authMiddleware, LEER, async (req, res) => {
+  try {
+    const { obraId, subId } = req.params;
+    const d = await cargar(obraId, subId);
+    if (!d) return res.status(404).json({ message: "Subcontrato no encontrado" });
+
+    let periodos = d.planPeriodos.map((p) => ({
+      numero: p.numero, desde: norm(p.desde), hasta: norm(p.hasta),
+      items: (d.planItemsPorPeriodo[p.id] || []).map((pi) => ({
+        subcontrato_item_id: pi.subcontrato_item_id, cantidad: Number(pi.cantidad),
+      })),
+    }));
+    // Sin plan todavía: se proponen períodos desde el inicio del contrato.
+    const propuesto = !periodos.length;
+    if (propuesto) {
+      const inicio = d.sub.fecha_inicio || d.sub.fecha_contrato || hoyISO();
+      periodos = generarPeriodos({ inicio, periodicidad: d.sub.periodicidad, cantidad: d.sub.periodicidad === "semanal" ? 12 : 8 })
+        .map((p) => ({ ...p, items: [] }));
+    }
+
+    return res.json({
+      subcontrato: datosCabecera(d.sub),
+      items: itemsPlanos(d.items),
+      total_contrato: totalContrato(d.items),
+      periodos,
+      propuesto,
+    });
+  } catch (error) {
+    console.error("Error plan subcontrato:", error);
+    return res.status(500).json({ message: "Error al cargar el plan" });
+  }
+});
+
+router.put("/:obraId/subcontratos/:subId/plan", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  const rechazar = async (message) => { await t.rollback(); return res.status(400).json({ message }); };
+  try {
+    const { obraId, subId } = req.params;
+    const d = await cargar(obraId, subId, t);
+    if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
+
+    const periodos = (Array.isArray(req.body.periodos) ? req.body.periodos : [])
+      .map((p) => ({ ...p, desde: norm(p.desde), hasta: norm(p.hasta) }))
+      .sort((a, b) => (a.desde < b.desde ? -1 : 1));
+    if (!periodos.length) return rechazar("El plan tiene que tener al menos un período.");
+
+    const itemsPorId = new Map(d.items.map((i) => [i.id, i]));
+    const totalPorItem = {};
+    for (let i = 0; i < periodos.length; i++) {
+      const p = periodos[i];
+      if (!esFecha(p.desde) || !esFecha(p.hasta) || p.desde > p.hasta) return rechazar("Hay un período con fechas inválidas.");
+      if (i > 0 && periodos[i - 1].hasta >= p.desde) return rechazar("Hay dos períodos del plan que se pisan.");
+      const vistos = new Set();
+      for (const pi of p.items || []) {
+        const id = Number(pi.subcontrato_item_id);
+        const cantidad = Number(pi.cantidad);
+        if (!itemsPorId.has(id)) return rechazar("Hay ítems que no son de este subcontrato.");
+        if (!Number.isFinite(cantidad) || cantidad < 0) return rechazar("Hay cantidades inválidas en el plan.");
+        if (vistos.has(id)) return rechazar("Un ítem aparece dos veces en el mismo período.");
+        vistos.add(id);
+        totalPorItem[id] = (totalPorItem[id] || 0) + cantidad;
       }
-      if (!Array.isArray(items) || items.length === 0) {
-        await t.rollback();
-        return res.status(400).json({ message: "Hay que indicar al menos un ítem a cargo del subcontratista" });
+    }
+    // El plan reparte lo contratado: un ítem no puede planificarse de más.
+    for (const [id, total] of Object.entries(totalPorItem)) {
+      const it = itemsPorId.get(Number(id));
+      if (total > Number(it.cantidad) + TOLERANCIA) {
+        return rechazar(`El ítem "${it.descripcion}" tiene ${r4(total)} ${it.unidad || ""} planificados y el contrato dice ${r4(it.cantidad)}.`);
       }
-      if (estado && !ESTADOS.includes(estado)) {
-        await t.rollback();
-        return res.status(400).json({ message: "Estado inválido" });
-      }
+    }
 
-      const obra = await Obra.findByPk(obraId);
-      if (!obra) { await t.rollback(); return res.status(404).json({ message: "Obra no encontrada" }); }
-
-      // Los ítems tienen que ser del pliego de ESTA obra.
-      const idsPliego = (await PliegoItem.findAll({ where: { obraId }, attributes: ["id"], raw: true })).map((i) => i.id);
-      for (const it of items) {
-        if (!idsPliego.includes(Number(it.pliego_item_id))) {
-          await t.rollback();
-          return res.status(400).json({ message: `El ítem ${it.pliego_item_id} no pertenece al pliego de esta obra` });
-        }
-        if (Number(it.precio_acordado) < 0 || Number.isNaN(Number(it.precio_acordado))) {
-          await t.rollback();
-          return res.status(400).json({ message: "El precio acordado debe ser un número válido" });
-        }
-      }
-
-      const sub = await Subcontrato.create({
-        obra_id: obraId,
-        subcontratista: String(subcontratista).trim(),
-        cuit: cuit || null,
-        fecha_contrato: fecha_contrato || null,
-        estado: estado || "vigente",
-        observaciones: observaciones || null,
-      }, { transaction: t });
-
-      await SubcontratoItem.bulkCreate(
-        items.map((i) => ({
-          subcontrato_id: sub.id,
-          pliego_item_id: Number(i.pliego_item_id),
-          precio_acordado: Number(i.precio_acordado || 0),
-        })),
-        { transaction: t }
+    const viejos = d.planPeriodos.map((p) => p.id);
+    if (viejos.length) {
+      await SubcontratoPlanItem.destroy({ where: { plan_periodo_id: viejos }, transaction: t });
+      await SubcontratoPlanPeriodo.destroy({ where: { id: viejos }, transaction: t });
+    }
+    for (const [i, p] of periodos.entries()) {
+      const fila = await SubcontratoPlanPeriodo.create(
+        { subcontrato_id: d.sub.id, numero: i + 1, desde: p.desde, hasta: p.hasta }, { transaction: t }
       );
-
-      await t.commit();
-      return res.status(201).json({ ok: true, subcontrato_id: sub.id, items: items.length });
-    } catch (error) {
-      await t.rollback();
-      console.error("Error creando subcontrato:", error);
-      return res.status(500).json({ message: "Error al crear el subcontrato", error: error.message });
+      const items = (p.items || []).filter((pi) => Number(pi.cantidad) > 0)
+        .map((pi) => ({ plan_periodo_id: fila.id, subcontrato_item_id: Number(pi.subcontrato_item_id), cantidad: r4(pi.cantidad) }));
+      if (items.length) await SubcontratoPlanItem.bulkCreate(items, { transaction: t });
     }
+    await t.commit();
+    return res.json({ ok: true, message: "Plan guardado" });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error guardando plan subcontrato:", error);
+    return res.status(500).json({ message: "Error al guardar el plan" });
   }
-);
+});
 
 /* ======================================================
-   EDITAR un subcontrato (reemplaza sus ítems)
+   CERTIFICADOS
 ====================================================== */
-router.put(
-  "/:obraId/subcontratos/:subId",
-  authMiddleware,
-  hasRole([ROLES.ADMIN, ROLES.OPERATOR]),
-  async (req, res) => {
-    const t = await sequelize.transaction();
-    try {
-      const { obraId, subId } = req.params;
-      const sub = await Subcontrato.findOne({ where: { id: subId, obra_id: obraId } });
-      if (!sub) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
 
-      const { subcontratista, cuit, fecha_contrato, estado, observaciones, items } = req.body;
-      if (estado && !ESTADOS.includes(estado)) {
-        await t.rollback();
-        return res.status(400).json({ message: "Estado inválido" });
-      }
+/** La planilla de un certificado, con cabecera y descuentos. */
+function armarPlanilla(d, cert) {
+  const p = planillaDe({
+    items: d.items, certificados: d.vigentes, certItemsPorCert: d.certItemsPorCert,
+    descuentos: d.descuentosPorCert[cert.id] || [], certificado: cert,
+  });
+  const ultimo = d.vigentes[d.vigentes.length - 1];
+  return {
+    subcontrato: datosCabecera(d.sub),
+    certificado: {
+      id: cert.id || null, numero: cert.numero, desde: norm(cert.desde), hasta: norm(cert.hasta),
+      fecha: norm(cert.fecha) || null, anulado: !!cert.anulado, observaciones: cert.observaciones || null,
+    },
+    filas: p.filas,
+    totales: p.totales,
+    descuentos: (d.descuentosPorCert[cert.id] || []).map((x) => ({ tipo: x.tipo, concepto: x.concepto, importe: Number(x.importe) })),
+    // Solo se corrige el último; uno nuevo, siempre.
+    editable: !cert.id || (!cert.anulado && cert.id === ultimo?.id),
+  };
+}
 
-      await sub.update({
-        subcontratista: subcontratista !== undefined ? String(subcontratista).trim() : sub.subcontratista,
-        cuit: cuit !== undefined ? cuit : sub.cuit,
-        fecha_contrato: fecha_contrato !== undefined ? (fecha_contrato || null) : sub.fecha_contrato,
-        estado: estado || sub.estado,
-        observaciones: observaciones !== undefined ? observaciones : sub.observaciones,
-      }, { transaction: t });
+router.get("/:obraId/subcontratos/:subId/certificados/nuevo", authMiddleware, LEER, async (req, res) => {
+  try {
+    const { obraId, subId } = req.params;
+    const d = await cargar(obraId, subId);
+    if (!d) return res.status(404).json({ message: "Subcontrato no encontrado" });
+    const ultimo = d.vigentes[d.vigentes.length - 1];
+    const periodo = sugerirPeriodo({
+      ultimoHasta: ultimo ? norm(ultimo.hasta) : null,
+      inicio: d.sub.fecha_inicio || d.sub.fecha_contrato,
+      periodicidad: d.sub.periodicidad,
+    });
+    const numero = d.todos.reduce((m, c) => Math.max(m, c.numero), 0) + 1;
+    return res.json(armarPlanilla(d, { id: null, numero, desde: periodo.desde, hasta: periodo.hasta, fecha: hoyISO() }));
+  } catch (error) {
+    console.error("Error certificado nuevo:", error);
+    return res.status(500).json({ message: "Error al preparar el certificado" });
+  }
+});
 
-      if (Array.isArray(items)) {
-        await SubcontratoItem.destroy({ where: { subcontrato_id: sub.id }, transaction: t });
-        await SubcontratoItem.bulkCreate(
-          items.map((i) => ({
-            subcontrato_id: sub.id,
-            pliego_item_id: Number(i.pliego_item_id),
-            precio_acordado: Number(i.precio_acordado || 0),
-          })),
-          { transaction: t }
-        );
-      }
+router.get("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, LEER, async (req, res) => {
+  try {
+    const { obraId, subId, certId } = req.params;
+    const d = await cargar(obraId, subId);
+    if (!d) return res.status(404).json({ message: "Subcontrato no encontrado" });
+    const cert = d.todos.find((c) => c.id === Number(certId));
+    if (!cert) return res.status(404).json({ message: "Certificado no encontrado" });
+    return res.json(armarPlanilla(d, cert));
+  } catch (error) {
+    console.error("Error planilla certificado:", error);
+    return res.status(500).json({ message: "Error al cargar el certificado" });
+  }
+});
 
-      await t.commit();
-      return res.json({ ok: true, message: "Subcontrato actualizado" });
-    } catch (error) {
+/**
+ * Valida un certificado. `anteriorHasta` es el cierre del certificado previo:
+ * los períodos no se pueden pisar.
+ */
+function validarCertificado({ body, d, anteriorHasta }) {
+  const desde = norm(body.desde);
+  const hasta = norm(body.hasta);
+  if (!esFecha(desde) || !esFecha(hasta) || desde > hasta) return { error: "Indicá el período: desde y hasta." };
+  if (anteriorHasta && desde <= anteriorHasta) {
+    return { error: `El período se pisa con el certificado anterior, que llega hasta el ${anteriorHasta}.` };
+  }
+  if (body.fecha && !esFecha(norm(body.fecha))) return { error: "La fecha del certificado no es válida." };
+
+  const itemsPorId = new Map(d.items.map((i) => [i.id, i]));
+  const vistos = new Set();
+  const items = [];
+  for (const ci of Array.isArray(body.items) ? body.items : []) {
+    const id = Number(ci.subcontrato_item_id);
+    const cantidad = Number(ci.cantidad);
+    if (!itemsPorId.has(id)) return { error: "Hay ítems que no son de este subcontrato." };
+    if (!Number.isFinite(cantidad) || cantidad < 0) return { error: "Hay cantidades inválidas." };
+    if (vistos.has(id)) return { error: "Un ítem aparece dos veces en el certificado." };
+    vistos.add(id);
+    if (cantidad > 0) items.push({ id, cantidad: r4(cantidad) });
+  }
+
+  const descuentos = [];
+  for (const x of Array.isArray(body.descuentos) ? body.descuentos : []) {
+    const importe = Number(x.importe);
+    const tipo = TIPOS_DESCUENTO.includes(x.tipo) ? x.tipo : "otro";
+    const concepto = String(x.concepto || "").trim();
+    if (!Number.isFinite(importe) || importe <= 0) return { error: "Cada descuento necesita un importe mayor a 0." };
+    if (tipo === "otro" && !concepto) return { error: "Un descuento de tipo 'otro' necesita que digas qué es." };
+    descuentos.push({ tipo, concepto: concepto || null, importe: r2(importe) });
+  }
+
+  if (!items.length && !descuentos.length) return { error: "El certificado está vacío: cargá cantidades o descuentos." };
+  return { desde, hasta, fecha: body.fecha ? norm(body.fecha) : null, observaciones: body.observaciones || null, items, descuentos };
+}
+
+/** Excedentes que produce el certificado: se avisan, no se rechazan. */
+function avisosDeExcedente(d, datos, excluirCertId) {
+  const previo = {};
+  for (const c of d.vigentes) {
+    if (c.id === excluirCertId) continue;
+    for (const ci of d.certItemsPorCert[c.id] || []) {
+      previo[ci.subcontrato_item_id] = (previo[ci.subcontrato_item_id] || 0) + Number(ci.cantidad);
+    }
+  }
+  const avisos = [];
+  for (const ci of datos.items) {
+    const it = d.items.find((i) => i.id === ci.id);
+    const acum = (previo[ci.id] || 0) + ci.cantidad;
+    const exced = acum - Number(it.cantidad);
+    if (exced > TOLERANCIA) {
+      avisos.push({
+        subcontrato_item_id: it.id,
+        descripcion: it.descripcion,
+        excedente: r4(exced),
+        mensaje: `"${it.descripcion}": el acumulado (${r4(acum)} ${it.unidad || ""}) supera lo contratado (${r4(it.cantidad)}). Quedan ${r4(exced)} ${it.unidad || ""} como excedente.`,
+      });
+    }
+  }
+  return avisos;
+}
+
+async function guardarItemsYDescuentos({ cert, datos, d, preciosPrevios, t }) {
+  const itemsPorId = new Map(d.items.map((i) => [i.id, i]));
+  if (datos.items.length) {
+    await SubcontratoCertificadoItem.bulkCreate(
+      datos.items.map((ci) => ({
+        certificado_id: cert.id,
+        subcontrato_item_id: ci.id,
+        cantidad: ci.cantidad,
+        // Se congela el precio: el que ya tenía esa línea si se está
+        // corrigiendo, o el vigente del ítem si es nueva.
+        precio_unitario: preciosPrevios[ci.id] ?? Number(itemsPorId.get(ci.id).precio_unitario),
+      })),
+      { transaction: t }
+    );
+  }
+  if (datos.descuentos.length) {
+    await SubcontratoDescuento.bulkCreate(datos.descuentos.map((x) => ({ ...x, certificado_id: cert.id })), { transaction: t });
+  }
+}
+
+router.post("/:obraId/subcontratos/:subId/certificados", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const { obraId, subId } = req.params;
+    const d = await cargar(obraId, subId, t);
+    if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
+    if (d.sub.estado === "anulado") { await t.rollback(); return res.status(400).json({ message: "El subcontrato está anulado." }); }
+
+    const ultimo = d.vigentes[d.vigentes.length - 1];
+    const datos = validarCertificado({ body: req.body, d, anteriorHasta: ultimo ? norm(ultimo.hasta) : null });
+    if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
+
+    const numero = d.todos.reduce((m, c) => Math.max(m, c.numero), 0) + 1;
+    const cert = await SubcontratoCertificado.create({
+      subcontrato_id: d.sub.id, numero, desde: datos.desde, hasta: datos.hasta,
+      fecha: datos.fecha || hoyISO(), observaciones: datos.observaciones, creado_por_id: req.user?.id || null,
+    }, { transaction: t });
+    await guardarItemsYDescuentos({ cert, datos, d, preciosPrevios: {}, t });
+
+    const avisos = avisosDeExcedente(d, datos, null);
+    await t.commit();
+    return res.status(201).json({ ok: true, id: cert.id, numero, avisos, hay_excedentes: avisos.length > 0, message: `Certificado N° ${numero} guardado` });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error creando certificado de subcontrato:", error);
+    return res.status(500).json({ message: "Error al guardar el certificado" });
+  }
+});
+
+router.put("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const { obraId, subId, certId } = req.params;
+    const d = await cargar(obraId, subId, t);
+    if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
+    const cert = d.vigentes.find((c) => c.id === Number(certId));
+    if (!cert) { await t.rollback(); return res.status(404).json({ message: "Certificado no encontrado" }); }
+    // Solo el último: corregir uno del medio cambiaría el "anterior" de los
+    // siguientes, que ya se pagaron.
+    if (cert.id !== d.vigentes[d.vigentes.length - 1].id) {
       await t.rollback();
-      console.error("Error actualizando subcontrato:", error);
-      return res.status(500).json({ message: "Error al actualizar el subcontrato" });
+      return res.status(400).json({ message: "Solo se puede corregir el último certificado." });
     }
-  }
-);
 
-/* ======================================================
-   BORRAR un subcontrato
-====================================================== */
-router.delete(
-  "/:obraId/subcontratos/:subId",
-  authMiddleware,
-  hasRole([ROLES.ADMIN]),
-  async (req, res) => {
-    const t = await sequelize.transaction();
-    try {
-      const sub = await Subcontrato.findOne({ where: { id: req.params.subId, obra_id: req.params.obraId } });
-      if (!sub) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
-      await SubcontratoItem.destroy({ where: { subcontrato_id: sub.id }, transaction: t });
-      await sub.destroy({ transaction: t });
-      await t.commit();
-      return res.json({ ok: true, message: "Subcontrato eliminado" });
-    } catch (error) {
+    const previo = d.vigentes[d.vigentes.length - 2];
+    const datos = validarCertificado({ body: req.body, d, anteriorHasta: previo ? norm(previo.hasta) : null });
+    if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
+
+    const preciosPrevios = Object.fromEntries(
+      (d.certItemsPorCert[cert.id] || []).map((ci) => [ci.subcontrato_item_id, Number(ci.precio_unitario)])
+    );
+    await SubcontratoCertificado.update(
+      { desde: datos.desde, hasta: datos.hasta, fecha: datos.fecha || cert.fecha, observaciones: datos.observaciones },
+      { where: { id: cert.id }, transaction: t }
+    );
+    await SubcontratoCertificadoItem.destroy({ where: { certificado_id: cert.id }, transaction: t });
+    await SubcontratoDescuento.destroy({ where: { certificado_id: cert.id }, transaction: t });
+    await guardarItemsYDescuentos({ cert, datos, d, preciosPrevios, t });
+
+    const avisos = avisosDeExcedente(d, datos, cert.id);
+    await t.commit();
+    return res.json({ ok: true, avisos, hay_excedentes: avisos.length > 0, message: `Certificado N° ${cert.numero} corregido` });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error editando certificado de subcontrato:", error);
+    return res.status(500).json({ message: "Error al corregir el certificado" });
+  }
+});
+
+router.post("/:obraId/subcontratos/:subId/certificados/:certId/anular", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const { obraId, subId, certId } = req.params;
+    const d = await cargar(obraId, subId, t);
+    if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
+    const cert = d.vigentes.find((c) => c.id === Number(certId));
+    if (!cert) { await t.rollback(); return res.status(404).json({ message: "Certificado no encontrado o ya anulado" }); }
+    if (cert.id !== d.vigentes[d.vigentes.length - 1].id) {
       await t.rollback();
-      console.error("Error borrando subcontrato:", error);
-      return res.status(500).json({ message: "Error al borrar el subcontrato" });
+      return res.status(400).json({ message: "Solo se puede anular el último certificado." });
     }
+    await SubcontratoCertificado.update({ anulado: true }, { where: { id: cert.id }, transaction: t });
+    await t.commit();
+    return res.json({ ok: true, message: `Certificado N° ${cert.numero} anulado` });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error anulando certificado de subcontrato:", error);
+    return res.status(500).json({ message: "Error al anular el certificado" });
   }
-);
-
-/* ======================================================
-   LIQUIDACIÓN — cuánto le corresponde cobrar, quincena por quincena
-   Cada avance de obra es una quincena. Por cada ítem avanzado que esté
-   en el subcontrato:   a pagar = precio_acordado × (% avanzado / 100)
-====================================================== */
-router.get(
-  "/:obraId/subcontratos/:subId/liquidacion",
-  authMiddleware,
-  hasRole([ROLES.ADMIN, ROLES.OPERATOR, ROLES.VIEWER]),
-  async (req, res) => {
-    try {
-      const { obraId, subId } = req.params;
-
-      const sub = await Subcontrato.findOne({
-        where: { id: subId, obra_id: obraId },
-        include: [{
-          model: SubcontratoItem, as: "items",
-          include: [{ model: PliegoItem, as: "pliegoItem", attributes: ["id", "numeroItem", "descripcionItem", "unidadMedida"] }],
-        }],
-      });
-      if (!sub) return res.status(404).json({ message: "Subcontrato no encontrado" });
-
-      // Precio acordado por ítem, para cruzar contra los avances.
-      const precioPorItem = {};
-      const datosItem = {};
-      (sub.items || []).forEach((i) => {
-        precioPorItem[i.pliego_item_id] = Number(i.precio_acordado || 0);
-        datosItem[i.pliego_item_id] = i.pliegoItem ? i.pliegoItem.toJSON() : null;
-      });
-      const idsDelSub = Object.keys(precioPorItem).map(Number);
-
-      // Solo se liquida lo ejecutado DESDE la fecha del contrato en adelante.
-      // Sin este filtro, un subcontrato firmado en septiembre se llevaría el
-      // avance que otro hizo en junio sobre esos mismos ítems.
-      const where = { obra_id: obraId };
-      if (sub.fecha_contrato) {
-        where.periodo_hasta = { [Op.gte]: sub.fecha_contrato };
-      }
-
-      const avances = await AvanceObra.findAll({
-        where,
-        order: [["periodo_desde", "ASC"], ["fecha_avance", "ASC"], ["id", "ASC"]],
-        raw: true,
-      });
-
-      const avanceItems = avances.length
-        ? await AvanceObraItem.findAll({ where: { avance_obra_id: avances.map((a) => a.id) }, raw: true })
-        : [];
-      const itemsPorAvance = {};
-      avanceItems.forEach((ai) => {
-        (itemsPorAvance[ai.avance_obra_id] ||= []).push(ai);
-      });
-
-      let acumulado = 0;
-      const quincenas = [];
-
-      for (const a of avances) {
-        const detalle = [];
-        let subtotal = 0;
-
-        for (const ai of itemsPorAvance[a.id] || []) {
-          if (!idsDelSub.includes(ai.pliego_item_id)) continue;   // ítem que no es del subcontratista
-          const porc = Number(ai.avance_porcentaje || 0);
-          const monto = Number(((precioPorItem[ai.pliego_item_id] * porc) / 100).toFixed(2));
-          subtotal += monto;
-          detalle.push({
-            pliego_item_id: ai.pliego_item_id,
-            numeroItem: datosItem[ai.pliego_item_id]?.numeroItem,
-            descripcion: datosItem[ai.pliego_item_id]?.descripcionItem,
-            avance_porcentaje: porc,
-            precio_acordado: precioPorItem[ai.pliego_item_id],
-            a_pagar: monto,
-          });
-        }
-
-        if (detalle.length === 0) continue;   // esa quincena el sub no tocó ítems suyos
-
-        subtotal = Number(subtotal.toFixed(2));
-        acumulado = Number((acumulado + subtotal).toFixed(2));
-
-        const q = analizarQuincena(a.periodo_desde, a.periodo_hasta);
-
-        quincenas.push({
-          avance_id: a.id,
-          numero_avance: a.numero_avance,
-          desde: a.periodo_desde,
-          hasta: a.periodo_hasta,
-          fecha_avance: a.fecha_avance,
-          // Debería ir del 1 al 15 o del 16 a fin de mes. Si no, se avisa
-          // (pero se liquida igual: en la obra puede haber pasado así).
-          quincena: q.numero,
-          etiqueta: q.etiqueta,
-          quincena_correcta: q.valida,
-          observacion_periodo: q.motivo,
-          items: detalle,
-          a_pagar: subtotal,
-          acumulado,
-        });
-      }
-
-      const montoContrato = Number(
-        Object.values(precioPorItem).reduce((s, v) => s + v, 0).toFixed(2)
-      );
-
-      return res.json({
-        subcontrato: {
-          id: sub.id,
-          subcontratista: sub.subcontratista,
-          cuit: sub.cuit,
-          estado: sub.estado,
-          fecha_contrato: sub.fecha_contrato,
-          monto_contrato: montoContrato,
-          cantidad_items: idsDelSub.length,
-        },
-        quincenas,
-        total_liquidado: acumulado,
-        saldo_contrato: Number((montoContrato - acumulado).toFixed(2)),
-        avance_pct: montoContrato > 0 ? Number(((acumulado / montoContrato) * 100).toFixed(2)) : 0,
-      });
-    } catch (error) {
-      console.error("Error liquidación subcontrato:", error);
-      return res.status(500).json({ message: "Error al calcular la liquidación" });
-    }
-  }
-);
+});
 
 export default router;

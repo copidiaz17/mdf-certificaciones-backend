@@ -179,6 +179,26 @@ export async function migrar({ silencioso = false } = {}) {
     if (sueltos.length) log(`   ✅ ${sueltos.length} replanteo(s) viejo(s) pasados a versión propia`);
   }
 
+  // ── Subcontratos: circuito propio ────────────────────────────────────────
+  // El subcontrato deja de colgarse del avance de obra de la empresa: tiene su
+  // orden de compra con ítems, cantidades y precios propios, su plan y sus
+  // certificados. Las tablas nuevas (plan, certificados, descuentos) las crea
+  // sync(); acá se completan las dos que ya existían.
+  await agregarColumna("subcontratos", "numero_oc", "VARCHAR(255) NULL DEFAULT NULL", log);
+  await agregarColumna("subcontratos", "fecha_inicio", "DATE NULL DEFAULT NULL", log);
+  await agregarColumna("subcontratos", "periodicidad", "ENUM('quincenal','semanal') NOT NULL DEFAULT 'quincenal'", log);
+
+  await agregarColumna("subcontrato_items", "numero", "VARCHAR(255) NULL DEFAULT NULL", log);
+  await agregarColumna("subcontrato_items", "descripcion", "VARCHAR(600) NULL DEFAULT NULL", log);
+  await agregarColumna("subcontrato_items", "unidad", "VARCHAR(30) NULL DEFAULT NULL", log);
+  await agregarColumna("subcontrato_items", "cantidad", "DECIMAL(15,4) NOT NULL DEFAULT 0", log);
+  await agregarColumna("subcontrato_items", "precio_unitario", "DECIMAL(15,2) NOT NULL DEFAULT 0", log);
+  await agregarColumna("subcontrato_items", "origen", "ENUM('contrato','adicional') NOT NULL DEFAULT 'contrato'", log);
+  await agregarColumna("subcontrato_items", "orden", "INT NOT NULL DEFAULT 0", log);
+  // Un ítem que el pliego no tiene ("descarga de materiales") no tiene ítem
+  // de pliego: la columna pasa a admitir nulos.
+  await ajustarColumna("subcontrato_items", "pliego_item_id", "INT NULL DEFAULT NULL", log);
+
   log("✅ Esquema al día");
 }
 

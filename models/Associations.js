@@ -13,6 +13,8 @@ import AvanceObra from "./AvanceObra.js";
 import AvanceObraItem from "./AvanceObraItem.js";
 import Subcontrato from "./Subcontrato.js";
 import SubcontratoItem from "./SubcontratoItem.js";
+import { SubcontratoPlanPeriodo, SubcontratoPlanItem } from "./SubcontratoPlan.js";
+import { SubcontratoCertificado, SubcontratoCertificadoItem, SubcontratoDescuento } from "./SubcontratoCertificado.js";
 import InformeAvance from "./InformeAvance.js";
 import FotoInforme from "./FotoInforme.js";
 
@@ -170,6 +172,22 @@ SubcontratoItem.belongsTo(Subcontrato, { foreignKey: "subcontrato_id", as: "subc
 
 PliegoItem.hasMany(SubcontratoItem, { foreignKey: "pliego_item_id", as: "subcontratoItems" });
 SubcontratoItem.belongsTo(PliegoItem, { foreignKey: "pliego_item_id", as: "pliegoItem" });
+
+// Plan de trabajo del subcontratista, por período.
+Subcontrato.hasMany(SubcontratoPlanPeriodo, { foreignKey: "subcontrato_id", as: "planPeriodos" });
+SubcontratoPlanPeriodo.belongsTo(Subcontrato, { foreignKey: "subcontrato_id", as: "subcontrato" });
+SubcontratoPlanPeriodo.hasMany(SubcontratoPlanItem, { foreignKey: "plan_periodo_id", as: "items" });
+SubcontratoPlanItem.belongsTo(SubcontratoPlanPeriodo, { foreignKey: "plan_periodo_id", as: "periodo" });
+SubcontratoPlanItem.belongsTo(SubcontratoItem, { foreignKey: "subcontrato_item_id", as: "item" });
+
+// Certificados del subcontratista, con sus ítems y descuentos.
+Subcontrato.hasMany(SubcontratoCertificado, { foreignKey: "subcontrato_id", as: "certificados" });
+SubcontratoCertificado.belongsTo(Subcontrato, { foreignKey: "subcontrato_id", as: "subcontrato" });
+SubcontratoCertificado.hasMany(SubcontratoCertificadoItem, { foreignKey: "certificado_id", as: "items" });
+SubcontratoCertificadoItem.belongsTo(SubcontratoCertificado, { foreignKey: "certificado_id", as: "certificado" });
+SubcontratoCertificadoItem.belongsTo(SubcontratoItem, { foreignKey: "subcontrato_item_id", as: "item" });
+SubcontratoCertificado.hasMany(SubcontratoDescuento, { foreignKey: "certificado_id", as: "descuentos" });
+SubcontratoDescuento.belongsTo(SubcontratoCertificado, { foreignKey: "certificado_id", as: "certificado" });
 
 /* ======================================================
    🔹 INFORMES DE AVANCE
