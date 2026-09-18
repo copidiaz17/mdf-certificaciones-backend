@@ -26,15 +26,55 @@ import Planificacion from "../models/planificacion.js";
 import PlanificacionItem from "../models/planificacionItem.js";
 import AvanceObra from "../models/AvanceObra.js";
 import AvanceObraItem from "../models/AvanceObraItem.js";
+import Certificacion from "../models/Certificacion.js";
 
 import { authMiddleware } from "./auth.js";
 import { hasRole, ROLES } from "../middlewares/authorization.js";
 import {
   agruparVersiones, avancePorItemHasta, disponibleDeItem, ultimoCorte,
-  cierreDeAvance, esFecha, norm, r2,
+  cierreDeAvance, esFecha, norm, r2, ultimoMesCerrado,
 } from "../utils/planVersiones.js";
 
 const router = express.Router();
+
+/**
+ * ¿Está la obra al día para poder replantear?
+ *
+ * El avance de obra BLOQUEA: define el corte y cuánto se ejecutó de cada ítem.
+ * La certificación solo avisa, porque depende de la repartición y suele
+ * demorar por trámite.
+ */
+async function estadoAlDia({ obraId, avances, t }) {
+  const mesExigido = ultimoMesCerrado();
+  const ultimoAvance = ultimoCorte(avances);
+
+  const certs = await Certificacion.findAll({
+    where: { obra_id: obraId, anulada: false },
+    attributes: ["periodo_hasta"],
+    raw: true,
+    transaction: t,
+  });
+  let ultimoCertificado = "";
+  for (const c of certs) {
+    const f = norm(c.periodo_hasta);
+    if (f > ultimoCertificado) ultimoCertificado = f;
+  }
+
+  return {
+    mes_exigido: mesExigido,
+    ultimo_avance: ultimoAvance,
+    avance_al_dia: !!ultimoAvance && ultimoAvance >= mesExigido,
+    ultimo_certificado: ultimoCertificado || null,
+    certificacion_al_dia: !!ultimoCertificado && ultimoCertificado >= mesExigido,
+  };
+}
+
+function motivoBloqueo(estado) {
+  if (estado.avance_al_dia) return null;
+  return estado.ultimo_avance
+    ? `Para replantear hace falta el avance de obra cargado hasta el ${estado.mes_exigido}. El último cargado llega al ${estado.ultimo_avance}.`
+    : "Para replantear hace falta tener cargado el avance de obra: el replanteo parte de lo que ya se ejecutó.";
+}
 
 const MOTIVOS = ["tiempo", "adicional_item", "ambos"];
 const r5 = (n) => Number(Number(n || 0).toFixed(5));
@@ -273,10 +313,16 @@ router.get(
         };
       }
 
+      const estado = await estadoAlDia({ obraId, avances });
+
       return res.json({
         obra: { id: obra.id, nombre: obra.nombre },
         fecha_corte: fechaCorte,
         ultimo_avance: ultimoCorte(avances),
+        al_dia: estado,
+        // Al editar un replanteo que ya existe no se exige nada: es una
+        // corrección de algo ya decidido, no un replanteo nuevo.
+        bloqueo: editando ? null : motivoBloqueo(estado),
         avance_real_obra: avanceRealObra,
         presupuesto_total: r2(presupuesto),
         items,
@@ -312,6 +358,11 @@ router.post(
       const base = await cargarObra(obraId, t);
       if (!base) { await t.rollback(); return res.status(404).json({ message: "Obra no encontrada" }); }
       const { pliego, versiones, avances, avanceItems } = base;
+
+      // Sin el avance al día el corte queda en un mes viejo y lo que falta se
+      // reparte mal. La certificación no bloquea: la pantalla la avisa.
+      const bloqueo = motivoBloqueo(await estadoAlDia({ obraId, avances, t }));
+      if (bloqueo) { await t.rollback(); return res.status(400).json({ message: bloqueo }); }
 
       const fechaCorte = norm(req.body.fecha_corte);
       const ultima = versiones.length ? versiones[versiones.length - 1] : null;

@@ -67,6 +67,20 @@ export function ultimoCorte(avances) {
   return max || null;
 }
 
+/**
+ * Último día del mes anterior al actual.
+ *
+ * Es hasta donde tiene que estar cargado el avance para poder replantear: el
+ * mes en curso todavía no cerró, así que no se exige. Un replanteo parte de
+ * que lo ejecutado ya está registrado; si el avance viene atrasado, el corte
+ * queda en un mes viejo y lo que falta se reparte mal.
+ */
+export function ultimoMesCerrado(hoy = new Date()) {
+  const fin = new Date(hoy.getFullYear(), hoy.getMonth(), 0);
+  const mes = String(fin.getMonth() + 1).padStart(2, "0");
+  return `${fin.getFullYear()}-${mes}-${String(fin.getDate()).padStart(2, "0")}`;
+}
+
 /** Porcentaje real acumulado por ítem, contando solo avances cerrados hasta el corte. */
 export function avancePorItemHasta(avances, avanceItems, fechaCorte) {
   const incluidos = new Set(
@@ -95,10 +109,10 @@ export function indiceDeCorte(periodos, fechaCorte) {
 /**
  * Serie de un replanteo sobre el eje de la curva.
  *
- * Arranca en el período del corte con el avance REAL acumulado a esa fecha, y
- * desde ahí suma lo que la versión planifica. Entre un mes y otro queda plana
- * (la curva es acumulada), así que no se corta en las quincenas sin datos.
- * Antes del corte y después de su último mes no tiene valor.
+ * Recorre el MISMO camino que la curva de avance real desde el inicio de la
+ * obra —lo que se hizo, hecho está— y desde el corte en adelante sigue lo que
+ * el replanteo distribuye, hasta terminar la obra. Entre un mes y otro queda
+ * plana (la curva es acumulada), así que no se corta.
  *
  * @param curvaAvance  acumulado real con "Inicio" en la posición 0
  * @param largo        cantidad total de etiquetas del eje
@@ -111,6 +125,11 @@ export function serieDeReplanteo({ version, periodos, curvaAvance, largo, itemsP
   periodos.forEach((p, i) => { if (p.planifIds.some((id) => ids.has(id))) ultimo = i; });
 
   const datos = new Array(largo).fill(null);
+
+  // Hasta el corte, la curva del replanteo ES la del avance real.
+  datos[0] = 0;
+  for (let i = 0; i <= corte; i++) datos[i + 1] = r2(Number(curvaAvance[i + 1] || 0));
+
   let acumulado = corte >= 0 ? Number(curvaAvance[corte + 1] || 0) : 0;
   datos[corte + 1] = r2(acumulado);
 

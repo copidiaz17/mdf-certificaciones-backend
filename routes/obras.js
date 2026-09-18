@@ -276,6 +276,7 @@ router.get(
 
       const empty = {
         labels: [],
+        labelsHasta: [],
         planificado: [],
         certificado: [],
         avance: [],
@@ -344,6 +345,7 @@ router.get(
         const anticipoMonto = (anticipoPorc / 100) * totalProyecto;
         return res.json({
           labels: ["Inicio"],
+          labelsHasta: [null],
           planificado: [0],
           certificado: [0],
           avance: [0],
@@ -353,14 +355,14 @@ router.get(
         });
       }
 
-      // 2.1) EJE QUINCENAL
-      // El avance se registra por quincena (del 1 al 15 y del 16 a fin de mes),
-      // que es como se le certifica al subcontratista. Por eso el eje se abre en
-      // dos puntos por mes: así el avance real dibuja su camino con ese detalle.
-      // La planificación y la certificación son mensuales y caen en la segunda
-      // quincena, cuando el mes cierra.
+      // 2.1) EJE MENSUAL
+      // El avance de obra se puede cargar por quincena, pero en la curva las dos
+      // quincenas de un mes suman UN SOLO punto mensual, igual que lo planificado
+      // y lo certificado. Antes el eje se abría en dos puntos por mes y la
+      // planificación caía en la segunda quincena, así que las tres curvas se
+      // comparaban sobre ejes distintos.
       //
-      // La curva es ACUMULADA: una quincena sin movimiento queda plana, no cortada.
+      // La curva es ACUMULADA: un mes sin movimiento queda plano, no cortado.
       const ULTIMO_DIA = (a, m) => new Date(a, m, 0).getDate();
       const aFecha = (a, m, d) => `${a}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 
@@ -379,26 +381,20 @@ router.get(
       const [anioFin, mesFin] = [Number(ultima.slice(0, 4)), Number(ultima.slice(5, 7))];
 
       while (anioCur < anioFin || (anioCur === anioFin && mesCur <= mesFin)) {
-        const ultimoDia = ULTIMO_DIA(anioCur, mesCur);
         periodos.push({
           fecha_desde: aFecha(anioCur, mesCur, 1),
-          fecha_hasta: aFecha(anioCur, mesCur, 15),
-          quincena: 1,
-          planifIds: [],
-        });
-        periodos.push({
-          fecha_desde: aFecha(anioCur, mesCur, 16),
-          fecha_hasta: aFecha(anioCur, mesCur, ultimoDia),
-          quincena: 2,
+          fecha_hasta: aFecha(anioCur, mesCur, ULTIMO_DIA(anioCur, mesCur)),
+          anio: anioCur,
+          mes: mesCur,
           planifIds: [],
         });
         mesCur++;
         if (mesCur > 12) { mesCur = 1; anioCur++; }
       }
 
-      // Cada cosa se imputa a la quincena en la que TERMINA: un período se
-      // reconoce cuando cierra. Así una planificación mensual cae en la 2ª
-      // quincena y un avance del 1 al 15 cae en la 1ª.
+      // Cada cosa se imputa al mes en el que TERMINA: un período se reconoce
+      // cuando cierra. Un avance del 1 al 15 y otro del 16 al 30 caen los dos
+      // en el mismo mes y se suman.
       const quincenaDe = (fechaHasta) => {
         const f = norm(fechaHasta);
         if (!f) return -1;
@@ -522,6 +518,10 @@ router.get(
       let acumuladoAvance = 0;
 
       const labels = [];
+      // Fecha de cierre de cada punto del eje, alineada con labels. La pantalla
+      // la usa para saber qué meses ya pasaron y cortar ahí la tabla de desvíos.
+      // Antes intentaba deducirlo del texto de la etiqueta y no podía.
+      const labelsHasta = [];
       const curvaPlan = [];
       const curvaCert = [];
       const curvaAvance = [];
@@ -532,6 +532,7 @@ router.get(
 
       // Inicio
       labels.push("Inicio");
+      labelsHasta.push(null);
       curvaPlan.push(0);
       curvaCert.push(0);
       curvaAvance.push(0);
@@ -553,7 +554,8 @@ router.get(
         const MESES_EJE = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"];
         const mEje = Number(fecha_desde.slice(5, 7));
         const aEje = fecha_desde.slice(2, 4);
-        labels.push(`${periodos[idxPeriodo].quincena}ª q ${MESES_EJE[mEje - 1]} ${aEje}`);
+        labels.push(`${MESES_EJE[mEje - 1]} ${aEje}`);
+        labelsHasta.push(fecha_hasta);
 
         // 🔵 PLANIFICADO
         let planPeriodo = 0;
@@ -675,6 +677,7 @@ router.get(
 
         extraPeriodos.forEach((ep) => {
           labels.push(`${ep.fecha_desde} → ${ep.fecha_hasta}`);
+          labelsHasta.push(ep.fecha_hasta);
 
           // Planificado: null para que el gráfico corte la línea
           curvaPlan.push(null);
@@ -816,6 +819,7 @@ router.get(
 
       return res.json({
         labels,
+        labelsHasta,
         planificado: planificadoVigente,
         certificado: curvaCert,
         avance: curvaAvance,

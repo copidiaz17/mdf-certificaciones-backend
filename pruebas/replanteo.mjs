@@ -8,9 +8,19 @@
 //   · el replanteo por ítem adicional nunca funcionó (ItemGeneralId null)
 //   · un replanteo no se podía editar ni borrar
 //
+// Reglas del negocio que se verifican:
+//   · el eje es MENSUAL: dos avances quincenales del mismo mes suman un punto
+//   · sin el avance de obra al día (último mes cerrado) no se puede replantear;
+//     la certificación solo avisa
+//   · la curva del replanteo recorre el mismo camino que el avance real y desde
+//     el corte sigue lo replanificado, hasta terminar la obra
+//
+// Las fechas son RELATIVAS al último mes cerrado, para que la suite no caduque.
+//   mes 0 = último mes cerrado · negativos = pasado · positivos = futuro
+//
 // Obra de $1.000.000:  A $400k · B $300k · C $200k · D $100k
-// Original mensual:    ene A50 · feb A50+B50 · mar B50+C100 · abr D100
-// Avance real:         ene A30 (12%) · feb A20+B10 (11%)  → 23% al 28/02
+// Original mensual:    m-3 A50 · m-2 A50+B50 · m-1 B50+C100 · m0 D100
+// Avance real:         m-3 A30 (12%) · m0 A20+B10 (11%)  → 23% al cierre de m0
 //
 // Corre SOLO contra una base local de prueba. Ver pruebas/LEEME.md.
 import { sequelize } from "../database.js";
@@ -22,10 +32,9 @@ import * as _path from "path";
 
 const _RAIZ = _path.join(_path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// Freno: esta suite crea, edita y borra, y además corre migraciones.
 const host = String(process.env.DB_HOST || "").toLowerCase();
 if (!["localhost", "127.0.0.1"].includes(host) || !/prueba/i.test(process.env.DB_NAME || "")) {
-  console.error("⛔ Solo contra una base LOCAL cuyo nombre diga 'prueba'. DB_HOST y DB_NAME actuales no califican.");
+  console.error("⛔ Solo contra una base LOCAL cuyo nombre diga 'prueba'.");
   process.exit(1);
 }
 
@@ -47,8 +56,17 @@ const req = async (m, ruta, body) => {
 };
 const sql = async (q) => { const [r] = await sequelize.query(q); return r; };
 
+// ── Calendario relativo ────────────────────────────────────────────────
+const MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+const pad = (n) => String(n).padStart(2, "0");
+const HOY = new Date();
+const mesDe = (o) => new Date(HOY.getFullYear(), HOY.getMonth() - 1 + o, 1); // o=0 → último mes cerrado
+const desde = (o) => { const d = mesDe(o); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-01`; };
+const hasta = (o) => { const d = mesDe(o); const u = new Date(d.getFullYear(), d.getMonth() + 1, 0); return `${u.getFullYear()}-${pad(u.getMonth() + 1)}-${pad(u.getDate())}`; };
+const eje = (o) => { const d = mesDe(o); return `${MESES[d.getMonth()]} ${String(d.getFullYear()).slice(2)}`; };
+
 const SUF = "RP" + Date.now().toString().slice(-6);
-let obraId = null;
+let obraId = null, obraAtrasada = null;
 const id = {};
 
 const curva = async () => (await req("GET", `/obras/${obraId}/curva-avance`)).data;
@@ -56,17 +74,20 @@ const en = (c, datos, etiqueta) => datos[c.labels.indexOf(etiqueta)];
 const serie = (c, version) => c.planificacionesCurvas.find((s) => s.version === version);
 const maximo = (datos) => Math.max(...datos.filter((v) => v != null));
 
-// v1: reparte EXACTAMENTE lo que falta ejecutar al 28/02
 const mesesV1 = () => [
-  { fecha_desde: "2026-03-01", fecha_hasta: "2026-03-31", items: [{ pliego_item_id: id.A, porcentaje: 30 }, { pliego_item_id: id.B, porcentaje: 40 }] },
-  { fecha_desde: "2026-04-01", fecha_hasta: "2026-04-30", items: [{ pliego_item_id: id.A, porcentaje: 20 }, { pliego_item_id: id.B, porcentaje: 50 }, { pliego_item_id: id.C, porcentaje: 60 }] },
-  { fecha_desde: "2026-05-01", fecha_hasta: "2026-05-31", items: [{ pliego_item_id: id.C, porcentaje: 40 }, { pliego_item_id: id.D, porcentaje: 100 }] },
+  { fecha_desde: desde(1), fecha_hasta: hasta(1), items: [{ pliego_item_id: id.A, porcentaje: 30 }, { pliego_item_id: id.B, porcentaje: 40 }] },
+  { fecha_desde: desde(2), fecha_hasta: hasta(2), items: [{ pliego_item_id: id.A, porcentaje: 20 }, { pliego_item_id: id.B, porcentaje: 50 }, { pliego_item_id: id.C, porcentaje: 60 }] },
+  { fecha_desde: desde(3), fecha_hasta: hasta(3), items: [{ pliego_item_id: id.C, porcentaje: 40 }, { pliego_item_id: id.D, porcentaje: 100 }] },
 ];
+
+async function crearObra(nombre) {
+  await sql(`INSERT INTO obras (nombre, solo_costo_total, createdAt, updatedAt) VALUES ('${nombre}', 0, NOW(), NOW())`);
+  return (await sql("SELECT LAST_INSERT_ID() id"))[0].id;
+}
 
 try {
   console.log("=== Preparando la obra ===");
-  await sql(`INSERT INTO obras (nombre, solo_costo_total, createdAt, updatedAt) VALUES ('REPLANTEO ${SUF}', 0, NOW(), NOW())`);
-  obraId = (await sql("SELECT LAST_INSERT_ID() id"))[0].id;
+  obraId = await crearObra(`REPLANTEO ${SUF}`);
   if (!(await sql("SELECT id FROM itemgenerals LIMIT 1")).length) {
     await sql(`INSERT INTO itemgenerals (nombre, unidadMedida, createdAt, updatedAt) VALUES ('Generico ${SUF}', 'gl', NOW(), NOW())`);
   }
@@ -76,60 +97,91 @@ try {
                VALUES (${obraId}, ${gen}, '${k}', 'Item ${k}', 'gl', 1, ${costo}, ${costo}, 'original')`);
     id[k] = (await sql("SELECT LAST_INSERT_ID() id"))[0].id;
   }
-  const original = [
-    ["2026-01-01", "2026-01-31", [["A", 50]]],
-    ["2026-02-01", "2026-02-28", [["A", 50], ["B", 50]]],
-    ["2026-03-01", "2026-03-31", [["B", 50], ["C", 100]]],
-    ["2026-04-01", "2026-04-30", [["D", 100]]],
-  ];
   id.original = [];
-  for (const [d, h, its] of original) {
+  for (const [o, its] of [[-3, [["A", 50]]], [-2, [["A", 50], ["B", 50]]], [-1, [["B", 50], ["C", 100]]], [0, [["D", 100]]]]) {
     const r = await req("POST", `/obras/${obraId}/planificacion`, {
-      fecha_desde: d, fecha_hasta: h, items: its.map(([k, p]) => ({ pliego_item_id: id[k], porcentaje_planificado: p })),
+      fecha_desde: desde(o), fecha_hasta: hasta(o),
+      items: its.map(([k, p]) => ({ pliego_item_id: id[k], porcentaje_planificado: p })),
     });
-    if (r.status !== 201) throw new Error(`original ${d} → ${r.status} ${r.data?.message}`);
+    if (r.status !== 201) throw new Error(`original ${o} → ${r.status} ${r.data?.message}`);
     id.original.push(r.data.planificacion_id);
   }
+
+  // El mes 0 se carga en DOS avances quincenales: en la curva tienen que ser
+  // un solo punto mensual.
   id.avances = [];
-  for (const [n, d, h, its] of [
-    [1, "2026-01-01", "2026-01-31", [["A", 30]]],
-    [2, "2026-02-01", "2026-02-28", [["A", 20], ["B", 10]]],
-  ]) {
+  const avances = [
+    [1, desde(-3), hasta(-3), [["A", 30]]],
+    [2, desde(0), `${desde(0).slice(0, 8)}15`, [["A", 20]]],
+    [3, `${desde(0).slice(0, 8)}16`, hasta(0), [["B", 10]]],
+  ];
+  for (const [n, d, h, its] of avances) {
     const r = await req("POST", `/obras/${obraId}/avances`, {
       numero_avance: n, fecha_avance: h, periodo_desde: d, periodo_hasta: h,
       items: its.map(([k, p]) => ({ pliego_item_id: id[k], avance_porcentaje: p })),
     });
-    if (r.status !== 201) throw new Error(`avance ${n} → ${r.status}`);
+    if (r.status !== 201) throw new Error(`avance ${n} → ${r.status} ${r.data?.message}`);
     id.avances.push(r.data.id);
   }
+
+  console.log("\n=== El eje es mensual ===");
+  let c = await curva();
+  check("las dos quincenas del mes son UN punto", c.labels.filter((l) => l === eje(0)).length === 1, `→ ${JSON.stringify(c.labels)}`);
+  check("y suman juntas: 12 + 11 = 23", cerca(en(c, c.avance, eje(0)), 23), `→ ${en(c, c.avance, eje(0))}`);
+  check("el eje trae la fecha de cierre de cada punto", c.labelsHasta?.[c.labels.indexOf(eje(0))] === hasta(0), `→ ${c.labelsHasta?.[c.labels.indexOf(eje(0))]}`);
 
   // ───────────────────────────────────────────────────────────────────
   console.log("\n=== El plan original se valida en el servidor ===");
   let r = await req("POST", `/obras/${obraId}/planificacion`, {
-    fecha_desde: "2026-06-01", fecha_hasta: "2026-06-30", tipo: "replanteo",
+    fecha_desde: desde(4), fecha_hasta: hasta(4), tipo: "replanteo",
     items: [{ pliego_item_id: id.A, porcentaje_planificado: 10 }],
   });
   check("un replanteo suelto por la ruta vieja se rechaza", r.status === 400, `→ ${r.status}`);
   r = await req("POST", `/obras/${obraId}/planificacion`, {
-    fecha_desde: "2026-06-01", fecha_hasta: "2026-06-30", items: [{ pliego_item_id: 999999999, porcentaje_planificado: 10 }],
+    fecha_desde: desde(4), fecha_hasta: hasta(4), items: [{ pliego_item_id: 999999999, porcentaje_planificado: 10 }],
   });
   check("un ítem de otra obra se rechaza", r.status === 400, `→ ${r.status}`);
   r = await req("POST", `/obras/${obraId}/planificacion`, {
-    fecha_desde: "2026-06-01", fecha_hasta: "2026-06-30", items: [{ pliego_item_id: id.C, porcentaje_planificado: 150 }],
+    fecha_desde: desde(4), fecha_hasta: hasta(4), items: [{ pliego_item_id: id.C, porcentaje_planificado: 150 }],
   });
   check("un porcentaje de 150 se rechaza", r.status === 400, `→ ${r.status}`);
   r = await req("POST", `/obras/${obraId}/planificacion`, {
-    fecha_desde: "2026-06-01", fecha_hasta: "2026-06-30", items: [{ pliego_item_id: id.A, porcentaje_planificado: 10 }],
+    fecha_desde: desde(4), fecha_hasta: hasta(4), items: [{ pliego_item_id: id.A, porcentaje_planificado: 10 }],
   });
   check("planificar un ítem por encima del 100% sumando meses se rechaza", r.status === 400, `→ ${r.status}`);
   console.log(`     "${r.data?.message}"`);
+
+  // ───────────────────────────────────────────────────────────────────
+  console.log("\n=== Sin avance al día no se replantea ===");
+  obraAtrasada = await crearObra(`ATRASADA ${SUF}`);
+  await sql(`INSERT INTO pliegoitems (obraId, ItemGeneralId, numeroItem, descripcionItem, unidadMedida, cantidad, costoUnitario, costoParcial, origen)
+             VALUES (${obraAtrasada}, ${gen}, '1', 'Unico', 'gl', 1, 100000, 100000, 'original')`);
+  const itemAtrasado = (await sql("SELECT LAST_INSERT_ID() id"))[0].id;
+  await req("POST", `/obras/${obraAtrasada}/planificacion`, {
+    fecha_desde: desde(-3), fecha_hasta: hasta(-3), items: [{ pliego_item_id: itemAtrasado, porcentaje_planificado: 100 }],
+  });
+  await req("POST", `/obras/${obraAtrasada}/avances`, {
+    numero_avance: 1, fecha_avance: hasta(-3), periodo_desde: desde(-3), periodo_hasta: hasta(-3),
+    items: [{ pliego_item_id: itemAtrasado, avance_porcentaje: 20 }],
+  });
+  r = await req("GET", `/obras/${obraAtrasada}/replanteos/contexto`);
+  check("la pantalla avisa que falta avance", !!r.data?.bloqueo, `→ ${r.data?.bloqueo}`);
+  check("y dice hasta qué mes hace falta", r.data?.al_dia?.mes_exigido === hasta(0), `→ ${r.data?.al_dia?.mes_exigido}`);
+  console.log(`     "${r.data?.bloqueo}"`);
+  r = await req("POST", `/obras/${obraAtrasada}/replanteos`, {
+    motivo: "tiempo", fecha_corte: hasta(-3),
+    meses: [{ fecha_desde: desde(1), fecha_hasta: hasta(1), items: [{ pliego_item_id: itemAtrasado, porcentaje: 80 }] }],
+  });
+  check("el servidor también lo bloquea", r.status === 400, `→ ${r.status}`);
 
   // ───────────────────────────────────────────────────────────────────
   console.log("\n=== El contexto de la grilla ===");
   r = await req("GET", `/obras/${obraId}/replanteos/contexto`);
   const ctx = r.data;
   const disp = Object.fromEntries(ctx.items.map((i) => [i.id, i.disponible]));
-  check("corte sugerido = último avance (28/02)", ctx.fecha_corte === "2026-02-28", `→ ${ctx.fecha_corte}`);
+  check("con el avance al día no hay bloqueo", ctx.bloqueo === null, `→ ${ctx.bloqueo}`);
+  check("corte sugerido = cierre del último mes", ctx.fecha_corte === hasta(0), `→ ${ctx.fecha_corte}`);
+  check("avisa que la certificación no está al día", ctx.al_dia.certificacion_al_dia === false);
   check("avance real de la obra al corte = 23%", cerca(ctx.avance_real_obra, 23), `→ ${ctx.avance_real_obra}`);
   check("disponible: A 50 · B 90 · C 100 · D 100",
     disp[id.A] === 50 && disp[id.B] === 90 && disp[id.C] === 100 && disp[id.D] === 100, `→ ${JSON.stringify(disp)}`);
@@ -137,20 +189,20 @@ try {
 
   // ───────────────────────────────────────────────────────────────────
   console.log("\n=== Crear el replanteo se valida entero ===");
-  const base = { motivo: "tiempo", fecha_corte: "2026-02-28" };
+  const base = { motivo: "tiempo", fecha_corte: hasta(0) };
   r = await req("POST", `/obras/${obraId}/replanteos`, { ...base, meses: [
-    { fecha_desde: "2026-03-01", fecha_hasta: "2026-03-31", items: [{ pliego_item_id: id.A, porcentaje: 40 }] },
-    { fecha_desde: "2026-04-01", fecha_hasta: "2026-04-30", items: [{ pliego_item_id: id.A, porcentaje: 20 }] },
+    { fecha_desde: desde(1), fecha_hasta: hasta(1), items: [{ pliego_item_id: id.A, porcentaje: 40 }] },
+    { fecha_desde: desde(2), fecha_hasta: hasta(2), items: [{ pliego_item_id: id.A, porcentaje: 20 }] },
   ] });
   check("R1 · A planificado 60% entre dos meses con 50% libre → rechazado", r.status === 400, `→ ${r.status}`);
   console.log(`     "${r.data?.message}"`);
   r = await req("POST", `/obras/${obraId}/replanteos`, { ...base, meses: [
-    { fecha_desde: "2026-02-01", fecha_hasta: "2026-02-28", items: [{ pliego_item_id: id.A, porcentaje: 10 }] },
+    { fecha_desde: desde(0), fecha_hasta: hasta(0), items: [{ pliego_item_id: id.A, porcentaje: 10 }] },
   ] });
   check("un mes anterior al corte se rechaza", r.status === 400, `→ ${r.status}`);
   r = await req("POST", `/obras/${obraId}/replanteos`, { ...base, meses: [
-    { fecha_desde: "2026-03-01", fecha_hasta: "2026-03-31", items: [{ pliego_item_id: id.A, porcentaje: 10 }] },
-    { fecha_desde: "2026-03-15", fecha_hasta: "2026-04-15", items: [{ pliego_item_id: id.B, porcentaje: 10 }] },
+    { fecha_desde: desde(1), fecha_hasta: hasta(2), items: [{ pliego_item_id: id.A, porcentaje: 10 }] },
+    { fecha_desde: desde(2), fecha_hasta: hasta(3), items: [{ pliego_item_id: id.B, porcentaje: 10 }] },
   ] });
   check("dos meses que se pisan se rechazan", r.status === 400, `→ ${r.status}`);
   r = await req("POST", `/obras/${obraId}/replanteos`, { ...base, motivo: "cualquiera", meses: mesesV1() });
@@ -162,100 +214,101 @@ try {
   check("ninguno de los rechazos dejó filas", Number((await sql(`SELECT COUNT(*) n FROM planificaciones WHERE obra_id = ${obraId} AND version > 0`))[0].n) === 0);
 
   r = await req("POST", `/obras/${obraId}/replanteos`, { ...base, meses: mesesV1() });
-  check("replanteo 1 (marzo a mayo) se guarda", r.status === 201 && r.data?.version === 1, `→ ${r.status} ${r.data?.message}`);
+  check("el replanteo (3 meses siguientes) se guarda", r.status === 201 && r.data?.version === 1, `→ ${r.status} ${r.data?.message}`);
 
   // ───────────────────────────────────────────────────────────────────
   console.log("\n=== La curva del replanteo ===");
-  let c = await curva();
+  c = await curva();
   let v1 = serie(c, 1);
   check("R2 · la curva del replanteo no pasa el 100%", maximo(v1.datos) <= 100.01, `→ ${maximo(v1.datos)}`);
-  check("arranca en el avance real al corte (23% en 2ª q feb)", cerca(en(c, v1.datos, "2ª q feb 26"), 23), `→ ${en(c, v1.datos, "2ª q feb 26")}`);
-  check("R5 · no se corta: 1ª q mar sigue en 23", cerca(en(c, v1.datos, "1ª q mar 26"), 23), `→ ${en(c, v1.datos, "1ª q mar 26")}`);
-  check("R7 · se reparte mes a mes: mar 47 · abr 82 · may 100",
-    cerca(en(c, v1.datos, "2ª q mar 26"), 47) && cerca(en(c, v1.datos, "2ª q abr 26"), 82) && cerca(en(c, v1.datos, "2ª q may 26"), 100),
-    `→ ${en(c, v1.datos, "2ª q mar 26")} · ${en(c, v1.datos, "2ª q abr 26")} · ${en(c, v1.datos, "2ª q may 26")}`);
+  check("recorre el mismo camino que el avance real: 12% en el primer mes",
+    cerca(en(c, v1.datos, eje(-3)), 12) && cerca(en(c, v1.datos, eje(-3)), en(c, c.avance, eje(-3))),
+    `→ ${en(c, v1.datos, eje(-3))} vs avance ${en(c, c.avance, eje(-3))}`);
+  check("R5 · no se corta en los meses sin avance", cerca(en(c, v1.datos, eje(-2)), 12) && cerca(en(c, v1.datos, eje(-1)), 12),
+    `→ ${en(c, v1.datos, eje(-2))} · ${en(c, v1.datos, eje(-1))}`);
+  check("llega al corte con el avance real (23%)", cerca(en(c, v1.datos, eje(0)), 23), `→ ${en(c, v1.datos, eje(0))}`);
+  check("R7 · y desde ahí reparte mes a mes: 47 · 82 · 100",
+    cerca(en(c, v1.datos, eje(1)), 47) && cerca(en(c, v1.datos, eje(2)), 82) && cerca(en(c, v1.datos, eje(3)), 100),
+    `→ ${en(c, v1.datos, eje(1))} · ${en(c, v1.datos, eje(2))} · ${en(c, v1.datos, eje(3))}`);
   check("es la vigente", v1.esVigente === true);
   check("la original sigue dibujada y llega a 100", cerca(maximo(serie(c, 0).datos), 100), `→ ${maximo(serie(c, 0).datos)}`);
   check("R3 · 'planificado' no pasa el 100%", maximo(c.planificado) <= 100.01, `→ ${maximo(c.planificado)}`);
-  check("'planificado' antes del corte es el original (feb 55%)", cerca(en(c, c.planificado, "2ª q feb 26"), 55), `→ ${en(c, c.planificado, "2ª q feb 26")}`);
-  check("'planificado' después del corte es el replanteo (mar 47%)", cerca(en(c, c.planificado, "2ª q mar 26"), 47), `→ ${en(c, c.planificado, "2ª q mar 26")}`);
+  check("'planificado' antes del corte es el original (55%)", cerca(en(c, c.planificado, eje(-2)), 55), `→ ${en(c, c.planificado, eje(-2))}`);
+  check("'planificado' después del corte es el replanteo (47%)", cerca(en(c, c.planificado, eje(1)), 47), `→ ${en(c, c.planificado, eje(1))}`);
 
   console.log("\n=== El historial ===");
   r = await req("GET", `/obras/${obraId}/planificaciones`);
   const hist = r.data;
   check("R4 · ningún acumulado pasa el 100%", hist.every((h) => h.total_porcentaje_acum <= 100.01), `→ ${Math.max(...hist.map((h) => h.total_porcentaje_acum))}`);
   const filasV1 = hist.filter((h) => h.version === 1);
-  check("el replanteo muestra sus 3 meses, acumulando desde el 23%: 47 · 82 · 100",
+  check("el replanteo acumula desde el 23%: 47 · 82 · 100",
     filasV1.length === 3 && cerca(filasV1[0].total_porcentaje_acum, 47) && cerca(filasV1[2].total_porcentaje_acum, 100),
     `→ ${filasV1.map((f) => f.total_porcentaje_acum).join(" · ")}`);
   check("el original muestra hasta 100", cerca(hist.filter((h) => h.version === 0).at(-1).total_porcentaje_acum, 100));
 
   const fila = (await sql(`SELECT * FROM planificaciones WHERE obra_id = ${obraId} AND version = 1 ORDER BY fecha_desde LIMIT 1`))[0];
   check("R9 · queda encadenado al plan que reemplaza", fila.planificacion_padre_id === id.original[0], `→ ${fila.planificacion_padre_id}`);
-  check("R9 · con el avance del corte", fila.avance_corte_id === id.avances[1], `→ ${fila.avance_corte_id}`);
+  check("R9 · con el avance del corte", id.avances.includes(fila.avance_corte_id), `→ ${fila.avance_corte_id}`);
 
   r = await req("GET", `/obras/${obraId}/items-disponible-planificacion`);
   check("el disponible del original no cuenta el replanteo", r.status === 200 && !(r.data || []).some((i) => i.porcentajeDisponible < 0));
 
   // ───────────────────────────────────────────────────────────────────
   console.log("\n=== Editar ===");
-  // Se pasa todo el ítem C de abril a mayo.
   const editado = [
-    { fecha_desde: "2026-03-01", fecha_hasta: "2026-03-31", items: [{ pliego_item_id: id.A, porcentaje: 30 }, { pliego_item_id: id.B, porcentaje: 40 }] },
-    { fecha_desde: "2026-04-01", fecha_hasta: "2026-04-30", items: [{ pliego_item_id: id.A, porcentaje: 20 }, { pliego_item_id: id.B, porcentaje: 50 }] },
-    { fecha_desde: "2026-05-01", fecha_hasta: "2026-05-31", items: [{ pliego_item_id: id.C, porcentaje: 100 }, { pliego_item_id: id.D, porcentaje: 100 }] },
+    { fecha_desde: desde(1), fecha_hasta: hasta(1), items: [{ pliego_item_id: id.A, porcentaje: 30 }, { pliego_item_id: id.B, porcentaje: 40 }] },
+    { fecha_desde: desde(2), fecha_hasta: hasta(2), items: [{ pliego_item_id: id.A, porcentaje: 20 }, { pliego_item_id: id.B, porcentaje: 50 }] },
+    { fecha_desde: desde(3), fecha_hasta: hasta(3), items: [{ pliego_item_id: id.C, porcentaje: 100 }, { pliego_item_id: id.D, porcentaje: 100 }] },
   ];
   r = await req("PUT", `/obras/${obraId}/replanteos/1`, { motivo: "tiempo", meses: editado });
   check("R6 · el replanteo se puede editar", r.status === 200, `→ ${r.status} ${r.data?.message}`);
   c = await curva(); v1 = serie(c, 1);
-  check("la edición se refleja: abr 70 · may 100",
-    cerca(en(c, v1.datos, "2ª q abr 26"), 70) && cerca(en(c, v1.datos, "2ª q may 26"), 100),
-    `→ ${en(c, v1.datos, "2ª q abr 26")} · ${en(c, v1.datos, "2ª q may 26")}`);
+  check("la edición se refleja: 70 · 100", cerca(en(c, v1.datos, eje(2)), 70) && cerca(en(c, v1.datos, eje(3)), 100),
+    `→ ${en(c, v1.datos, eje(2))} · ${en(c, v1.datos, eje(3))}`);
   r = await req("PUT", `/obras/${obraId}/replanteos/1`, { motivo: "tiempo", meses: [
-    { fecha_desde: "2026-03-01", fecha_hasta: "2026-03-31", items: [{ pliego_item_id: id.B, porcentaje: 95 }] },
+    { fecha_desde: desde(1), fecha_hasta: hasta(1), items: [{ pliego_item_id: id.B, porcentaje: 95 }] },
   ] });
   check("una edición inválida se rechaza", r.status === 400, `→ ${r.status}`);
   check("y no toca lo guardado", Number((await sql(`SELECT COUNT(*) n FROM planificaciones WHERE obra_id = ${obraId} AND version = 1`))[0].n) === 3);
 
   r = await req("PUT", `/obras/${obraId}/planificacion/${id.original[1]}`, {
-    fecha_desde: "2026-02-01", fecha_hasta: "2026-02-28",
+    fecha_desde: desde(-2), fecha_hasta: hasta(-2),
     items: [{ pliego_item_id: id.A, porcentaje_planificado: 50 }, { pliego_item_id: id.B, porcentaje_planificado: 40 }],
   });
   check("un mes del original se puede editar aunque haya replanteo", r.status === 200, `→ ${r.status} ${r.data?.message}`);
-  // Editar reemplaza las filas de la versión: el id de antes ya no existe.
   const filaV1 = async () => (await sql(`SELECT id FROM planificaciones WHERE obra_id = ${obraId} AND version = 1 ORDER BY fecha_desde LIMIT 1`))[0].id;
   r = await req("PUT", `/obras/${obraId}/planificacion/${await filaV1()}`, {
-    fecha_desde: "2026-03-01", fecha_hasta: "2026-03-31", items: [{ pliego_item_id: id.A, porcentaje_planificado: 10 }],
+    fecha_desde: desde(1), fecha_hasta: hasta(1), items: [{ pliego_item_id: id.A, porcentaje_planificado: 10 }],
   });
   check("un mes del replanteo NO se edita suelto", r.status === 400, `→ ${r.status}`);
 
   // ───────────────────────────────────────────────────────────────────
   console.log("\n=== Replanteo 2: con adicional y motivo 'ambos' ===");
   r = await req("POST", `/obras/${obraId}/avances`, {
-    numero_avance: 3, fecha_avance: "2026-03-31", periodo_desde: "2026-03-01", periodo_hasta: "2026-03-31",
+    numero_avance: 4, fecha_avance: hasta(0), periodo_desde: desde(0), periodo_hasta: hasta(0),
     items: [{ pliego_item_id: id.A, avance_porcentaje: 30 }, { pliego_item_id: id.B, avance_porcentaje: 20 }],
   });
   id.avances.push(r.data.id);
   const ctx2 = (await req("GET", `/obras/${obraId}/replanteos/contexto`)).data;
   const disp2 = Object.fromEntries(ctx2.items.map((i) => [i.id, i.disponible]));
-  check("nuevo corte 31/03 y disponible recalculado: A 20 · B 70",
-    ctx2.fecha_corte === "2026-03-31" && disp2[id.A] === 20 && disp2[id.B] === 70, `→ ${ctx2.fecha_corte} ${JSON.stringify(disp2)}`);
+  check("el disponible se recalcula con el avance nuevo: A 20 · B 70",
+    disp2[id.A] === 20 && disp2[id.B] === 70, `→ ${JSON.stringify(disp2)}`);
 
   const itemsAntes = Number((await sql(`SELECT COUNT(*) n FROM pliegoitems WHERE obraId = ${obraId}`))[0].n);
   const adicional = { clave: "rampa", descripcionItem: `Rampa ${SUF}`, unidadMedida: "m2", cantidad: 10, costoUnitario: 25000 };
   r = await req("POST", `/obras/${obraId}/replanteos`, {
-    motivo: "ambos", fecha_corte: "2026-03-31", adicionales: [adicional],
-    meses: [{ fecha_desde: "2026-03-15", fecha_hasta: "2026-04-30", items: [{ clave: "rampa", porcentaje: 100 }] }],
+    motivo: "ambos", fecha_corte: hasta(0), adicionales: [adicional],
+    meses: [{ fecha_desde: desde(0), fecha_hasta: hasta(1), items: [{ clave: "rampa", porcentaje: 100 }] }],
   });
   check("R10 · si el replanteo falla, el adicional NO queda en el pliego",
     r.status === 400 && Number((await sql(`SELECT COUNT(*) n FROM pliegoitems WHERE obraId = ${obraId}`))[0].n) === itemsAntes,
     `→ ${r.status}`);
 
   r = await req("POST", `/obras/${obraId}/replanteos`, {
-    motivo: "ambos", fecha_corte: "2026-03-31", adicionales: [adicional],
+    motivo: "ambos", fecha_corte: hasta(0), adicionales: [adicional],
     meses: [
-      { fecha_desde: "2026-04-01", fecha_hasta: "2026-04-30", items: [{ pliego_item_id: id.A, porcentaje: 20 }, { pliego_item_id: id.B, porcentaje: 70 }, { clave: "rampa", porcentaje: 50 }] },
-      { fecha_desde: "2026-05-01", fecha_hasta: "2026-05-31", items: [{ pliego_item_id: id.C, porcentaje: 100 }, { pliego_item_id: id.D, porcentaje: 100 }, { clave: "rampa", porcentaje: 50 }] },
+      { fecha_desde: desde(1), fecha_hasta: hasta(1), items: [{ pliego_item_id: id.A, porcentaje: 20 }, { pliego_item_id: id.B, porcentaje: 70 }, { clave: "rampa", porcentaje: 50 }] },
+      { fecha_desde: desde(2), fecha_hasta: hasta(2), items: [{ pliego_item_id: id.C, porcentaje: 100 }, { pliego_item_id: id.D, porcentaje: 100 }, { clave: "rampa", porcentaje: 50 }] },
     ],
   });
   check("R11 · el replanteo por adicional FUNCIONA", r.status === 201 && r.data?.version === 2, `→ ${r.status} ${r.data?.message}`);
@@ -292,11 +345,11 @@ try {
   // ───────────────────────────────────────────────────────────────────
   console.log("\n=== Migración de los replanteos cargados antes ===");
   await sql(`INSERT INTO planificaciones (obra_id, nombre, fecha_desde, fecha_hasta, estado, tipo, motivo, version, createdAt, updatedAt)
-             VALUES (${obraId}, 'viejo', '2026-06-01', '2026-06-30', 'abierta', 'replanteo', 'tiempo', 0, NOW(), NOW())`);
+             VALUES (${obraId}, 'viejo', '${desde(5)}', '${hasta(5)}', 'abierta', 'replanteo', 'tiempo', 0, NOW(), NOW())`);
   await migrar({ silencioso: true });
   const viejo = (await sql(`SELECT version, fecha_corte FROM planificaciones WHERE obra_id = ${obraId} AND nombre = 'viejo'`))[0];
   check("un replanteo viejo pasa a versión propia", Number(viejo.version) === 2, `→ ${viejo.version}`);
-  check("con corte el día anterior a su mes", String(viejo.fecha_corte).slice(0, 10) === "2026-05-31", `→ ${viejo.fecha_corte}`);
+  check("con corte el día anterior a su mes", String(viejo.fecha_corte).slice(0, 10) === hasta(4), `→ ${viejo.fecha_corte}`);
   await migrar({ silencioso: true });
   const otraVez = (await sql(`SELECT version FROM planificaciones WHERE obra_id = ${obraId} AND nombre = 'viejo'`))[0];
   check("la migración es idempotente", Number(otraVez.version) === 2, `→ ${otraVez.version}`);
@@ -305,13 +358,14 @@ try {
   console.error("EXPLOTO:", e.message, e.stack?.split("\n")[1]); fail++;
 } finally {
   console.log("\nLimpiando...");
-  if (obraId) {
-    await sql(`DELETE FROM planificacion_items WHERE planificacion_id IN (SELECT id FROM planificaciones WHERE obra_id = ${obraId})`);
-    await sql(`DELETE FROM planificaciones WHERE obra_id = ${obraId}`);
-    await sql(`DELETE FROM avance_obra_items WHERE avance_obra_id IN (SELECT id FROM avance_obras WHERE obra_id = ${obraId})`);
-    await sql(`DELETE FROM avance_obras WHERE obra_id = ${obraId}`);
-    await sql(`DELETE FROM pliegoitems WHERE obraId = ${obraId}`);
-    await sql(`DELETE FROM obras WHERE id = ${obraId}`);
+  for (const o of [obraId, obraAtrasada]) {
+    if (!o) continue;
+    await sql(`DELETE FROM planificacion_items WHERE planificacion_id IN (SELECT id FROM planificaciones WHERE obra_id = ${o})`);
+    await sql(`DELETE FROM planificaciones WHERE obra_id = ${o}`);
+    await sql(`DELETE FROM avance_obra_items WHERE avance_obra_id IN (SELECT id FROM avance_obras WHERE obra_id = ${o})`);
+    await sql(`DELETE FROM avance_obras WHERE obra_id = ${o}`);
+    await sql(`DELETE FROM pliegoitems WHERE obraId = ${o}`);
+    await sql(`DELETE FROM obras WHERE id = ${o}`);
   }
   await sql(`DELETE FROM itemgenerals WHERE nombre LIKE '%${SUF}%'`);
   const q = await sql(`SELECT COUNT(*) n FROM obras WHERE nombre LIKE '%${SUF}%'`);
