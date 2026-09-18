@@ -19,8 +19,71 @@ import { hasRole, ROLES } from "../middlewares/authorization.js";
 import {
   normalizarItem, acumuladoPorItem, avisosDeExcedente, calcularExcedentes,
 } from "../utils/excedentes.js";
+import {
+  agruparVersiones, serieDeReplanteo, planVigente, avancePorItemHasta, r2,
+} from "../utils/planVersiones.js";
 
 const router = express.Router();
+
+/**
+ * Valida un mes del plan ORIGINAL antes de crearlo o editarlo.
+ * Devuelve el mensaje de error, o null si está bien.
+ *
+ * Antes el servidor aceptaba cualquier cosa: ítems de otra obra, porcentajes
+ * negativos o de 300%, y el mismo ítem planificado por encima del 100% sumando
+ * meses. El único freno era el `max` del input en la pantalla.
+ */
+async function validarMesOriginal({ obraId, fecha_desde, fecha_hasta, items, transaction, excluirId = null }) {
+  const esFecha = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || "").slice(0, 10));
+  if (!esFecha(fecha_desde) || !esFecha(fecha_hasta)) return "Indicá las fechas desde y hasta.";
+  if (String(fecha_desde).slice(0, 10) > String(fecha_hasta).slice(0, 10)) {
+    return "La fecha desde no puede ser mayor que la fecha hasta.";
+  }
+  if (!Array.isArray(items) || !items.some((i) => Number(i.porcentaje_planificado) > 0)) {
+    return "Cargá al menos un ítem con porcentaje.";
+  }
+
+  const pliego = await PliegoItem.findAll({ where: { obraId }, attributes: ["id", "numeroItem"], raw: true, transaction });
+  const pliegoPorId = new Map(pliego.map((p) => [p.id, p]));
+  const vistos = new Set();
+  for (const item of items) {
+    const id = Number(item.pliego_item_id);
+    const pct = Number(item.porcentaje_planificado);
+    if (!pliegoPorId.has(id)) return "Hay ítems que no pertenecen al pliego de esta obra.";
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
+      return `El ítem ${pliegoPorId.get(id).numeroItem} tiene un porcentaje fuera de rango (0 a 100).`;
+    }
+    if (vistos.has(id)) return `El ítem ${pliegoPorId.get(id).numeroItem} está repetido.`;
+    vistos.add(id);
+  }
+
+  const otrosMeses = await Planificacion.findAll({
+    where: { obraId, version: 0, ...(excluirId ? { id: { [Op.ne]: excluirId } } : {}) },
+    raw: true,
+    transaction,
+  });
+
+  const desde = String(fecha_desde).slice(0, 10);
+  const hasta = String(fecha_hasta).slice(0, 10);
+  const pisa = otrosMeses.find((m) => String(m.fecha_desde).slice(0, 10) <= hasta && String(m.fecha_hasta).slice(0, 10) >= desde);
+  if (pisa) return "Ya existe una planificación original en ese período.";
+
+  const ids = otrosMeses.map((m) => m.id);
+  const yaPlanificado = {};
+  if (ids.length) {
+    const filas = await PlanificacionItem.findAll({ where: { planificacion_id: ids }, raw: true, transaction });
+    for (const f of filas) yaPlanificado[f.pliego_item_id] = (yaPlanificado[f.pliego_item_id] || 0) + Number(f.porcentaje_planificado || 0);
+  }
+  for (const item of items) {
+    const id = Number(item.pliego_item_id);
+    const total = (yaPlanificado[id] || 0) + Number(item.porcentaje_planificado || 0);
+    if (total > 100.01) {
+      const libre = Math.max(0, r2(100 - (yaPlanificado[id] || 0)));
+      return `El ítem ${pliegoPorId.get(id).numeroItem} quedaría planificado al ${r2(total)}%. Le queda ${libre}% libre.`;
+    }
+  }
+  return null;
+}
 
 /* ======================================================
    🔹 OBRAS
@@ -143,79 +206,48 @@ router.post(
 
     try {
       const { obraId } = req.params;
-      const {
-        fecha_desde, fecha_hasta, items,
-        tipo, motivo, planificacion_padre_id, avance_corte_id,
-      } = req.body;
+      const { fecha_desde, fecha_hasta, items, tipo } = req.body;
 
-      if (!fecha_desde || !fecha_hasta || !Array.isArray(items) || !items.length) {
-        return res.status(400).json({ message: "Datos incompletos para la planificación" });
-      }
-
-      if (new Date(fecha_desde) > new Date(fecha_hasta)) {
-        return res.status(400).json({ message: "La fecha desde no puede ser mayor que la fecha hasta" });
-      }
-
-      const tipoValido = tipo === "replanteo" ? "replanteo" : "original";
-
-      // El solapamiento de períodos se controla solo entre planificaciones
-      // ORIGINALES: un replanteo pisa a propósito el período de la que reemplaza.
-      if (tipoValido === "original") {
-        const existe = await Planificacion.findOne({
-          where: {
-            obraId,
-            tipo: "original",
-            [Op.or]: [
-              { fecha_desde: { [Op.between]: [fecha_desde, fecha_hasta] } },
-              { fecha_hasta: { [Op.between]: [fecha_desde, fecha_hasta] } },
-              {
-                [Op.and]: [
-                  { fecha_desde: { [Op.lte]: fecha_desde } },
-                  { fecha_hasta: { [Op.gte]: fecha_hasta } },
-                ],
-              },
-            ],
-          },
+      // Esta ruta carga meses del plan ORIGINAL. Un replanteo es una versión
+      // entera del plan y se carga por /replanteos, que sabe descontar lo ya
+      // replanteado y reemplazar el plan desde el corte. Cargado acá quedaba
+      // suelto y rompía la curva.
+      if (tipo === "replanteo") {
+        await t.rollback();
+        return res.status(400).json({
+          message: "Los replanteos se cargan desde la pantalla de Replanteo, con todos sus meses juntos.",
         });
-
-        if (existe) return res.status(400).json({ message: "Ya existe una planificación en ese período" });
       }
 
-      const motivosValidos = ["tiempo", "adicional_item"];
-      const motivoFinal = motivosValidos.includes(motivo) ? motivo : null;
+      const error = await validarMesOriginal({ obraId, fecha_desde, fecha_hasta, items, transaction: t });
+      if (error) {
+        await t.rollback();
+        return res.status(400).json({ message: error });
+      }
 
       const planificacion = await Planificacion.create(
         {
           obraId,
-          nombre: tipoValido === "replanteo"
-            ? `Replanteo ${fecha_desde} → ${fecha_hasta}`
-            : `Planificación ${fecha_desde} → ${fecha_hasta}`,
+          nombre: `Planificación ${fecha_desde} → ${fecha_hasta}`,
           fecha_desde,
           fecha_hasta,
           estado: "abierta",
-          tipo: tipoValido,
-          motivo: motivoFinal,
-          planificacion_padre_id: planificacion_padre_id || null,
-          avance_corte_id: avance_corte_id || null,
+          tipo: "original",
+          version: 0,
         },
         { transaction: t }
       );
 
-      for (const item of items) {
-        const { pliego_item_id, porcentaje_planificado } = item;
-
-        const pliego = await PliegoItem.findByPk(pliego_item_id);
-        if (!pliego) throw new Error(`Ítem de pliego no encontrado: ${pliego_item_id}`);
-
-        await PlanificacionItem.create(
-          {
+      await PlanificacionItem.bulkCreate(
+        items
+          .filter((i) => Number(i.porcentaje_planificado) > 0)
+          .map((i) => ({
             planificacion_id: planificacion.id,
-            pliego_item_id,
-            porcentaje_planificado: porcentaje_planificado || 0,
-          },
-          { transaction: t }
-        );
-      }
+            pliego_item_id: Number(i.pliego_item_id),
+            porcentaje_planificado: r2(i.porcentaje_planificado),
+          })),
+        { transaction: t }
+      );
 
       await t.commit();
       return res.status(201).json({
@@ -226,7 +258,7 @@ router.post(
     } catch (error) {
       await t.rollback();
       console.error("Error creando planificación:", error);
-      return res.status(500).json({ ok: false, error: error.message });
+      return res.status(500).json({ ok: false, message: "Error al crear la planificación" });
     }
   }
 );
@@ -264,9 +296,11 @@ router.get(
           : 0;
 
       // 1) Pliego -> costo total
+      // `origen` hace falta para medir la curva original sin los adicionales;
+      // sin traerlo, todos los ítems contaban como originales.
       const pliegoItems = await PliegoItem.findAll({
         where: { obraId },
-        attributes: ["id", "costoParcial"],
+        attributes: ["id", "costoParcial", "origen"],
         raw: true,
       });
       if (!pliegoItems.length) return res.json(empty);
@@ -375,6 +409,13 @@ router.get(
         const i = quincenaDe(p.fecha_hasta);
         if (i >= 0) periodos[i].planifIds.push(p.id);
       });
+
+      // La curva "planificado" base es SOLO el plan original (versión 0). Antes
+      // sumaba también los replanteos, que pisan los mismos meses, y llegaba a
+      // casi el doble del 100%.
+      const idsOriginal = new Set(
+        planificaciones.filter((p) => Number(p.version || 0) === 0).map((p) => p.id)
+      );
 
       // 3) Items de planificacion
       const planifIdsAll = planificaciones.map((p) => p.id);
@@ -516,7 +557,7 @@ router.get(
 
         // 🔵 PLANIFICADO
         let planPeriodo = 0;
-        planifIds.forEach((planifId) => {
+        planifIds.filter((id) => idsOriginal.has(id)).forEach((planifId) => {
           const itemsPlanif = planifItemsByPlanif[planifId] || [];
           itemsPlanif.forEach((i) => {
             const costo = costoItemMap[i.pliego_item_id] || 0;
@@ -669,13 +710,16 @@ router.get(
         });
       }
 
-      // ── Series de planificación: original vs replanteo ────────────────────
-      // Cuando hay replanteos se dibujan DOS curvas, para poder comparar lo
+      // ── Series de planificación: original y cada versión replanteada ─────
+      // Cuando hay replanteos se dibujan varias curvas, para poder comparar lo
       // que se prometió con lo que realmente pasó:
       //   · "original"  → la planificación inicial, como testigo histórico.
-      //   · "replanteo" → híbrida: avance real hasta donde hay avances
-      //                   cargados, y de ahí en adelante lo replanificado.
-      const tieneReplanteos = planificaciones.some((p) => p.tipo === "replanteo");
+      //   · "replanteo" → una por versión. Arranca en su corte con el avance
+      //                   real a esa fecha y sigue lo replanificado. La última
+      //                   es la vigente.
+      const versiones = agruparVersiones(planificaciones);
+      const versionesReplanteo = versiones.filter((v) => v.version > 0);
+      const tieneReplanteos = versionesReplanteo.length > 0;
       const planificacionesCurvas = [];
 
       // La serie original se mide contra el presupuesto SIN los ítems
@@ -716,67 +760,55 @@ router.get(
         return datos;
       };
 
-      // Curva híbrida del replanteo: pasado real + futuro replanificado.
-      const buildSerieReplanteoHibrida = (replanteosIds, total) => {
-        let ac = 0;
-        const datos = [0];
-        for (const periodo of periodos) {
-          const key = `${periodo.fecha_desde}__${periodo.fecha_hasta}`;
-          const avancePorc = avancePorPeriodoKey[key];
-          if (avancePorc !== undefined) {
-            // Período con avance real cargado → seguir la curva de avance.
-            ac += Number(avancePorc);
-            datos.push(Number(ac.toFixed(2)));
-          } else {
-            // Período futuro → seguir lo replanificado.
-            const ids = periodo.planifIds.filter((id) => replanteosIds.has(id));
-            if (ids.length === 0) {
-              datos.push(null);
-            } else {
-              let pp = 0;
-              ids.forEach((planifId) => {
-                (planifItemsByPlanif[planifId] || []).forEach((item) => {
-                  const costo = costoItemMap[item.pliego_item_id] || 0;
-                  pp += (Number(item.porcentaje_planificado) / 100) * (costo / total) * 100;
-                });
-              });
-              ac += pp;
-              datos.push(Number(ac.toFixed(2)));
-            }
-          }
-        }
-        while (datos.length < labels.length) datos.push(null);
-        return datos;
-      };
+      // `planificado` es el plan que rige en cada período: el original hasta el
+      // primer corte y cada replanteo desde el suyo. Lo usa la tabla de desvíos.
+      let planificadoVigente = curvaPlan;
 
       if (tieneReplanteos) {
-        const originalesIds = new Set(
-          planificaciones.filter((p) => (p.tipo || "original") === "original").map((p) => p.id)
-        );
-        const replanteosOrdenados = planificaciones
-          .filter((p) => p.tipo === "replanteo")
-          .sort((a, b) => a.id - b.id);
-        const replanteosIds = new Set(replanteosOrdenados.map((p) => p.id));
-
         planificacionesCurvas.push({
           serie: "original",
           tipo: "original",
+          version: 0,
           esVigente: false,
-          datos: buildSerie(originalesIds, totalOriginal),
+          datos: buildSerie(idsOriginal, totalOriginal),
         });
 
-        planificacionesCurvas.push({
-          serie: "replanteo",
-          tipo: "replanteo",
-          motivo: replanteosOrdenados[0]?.motivo || "tiempo",
-          esVigente: true,
-          datos: buildSerieReplanteoHibrida(replanteosIds, totalProyecto),
+        const series = versionesReplanteo.map((version) => ({
+          version,
+          ...serieDeReplanteo({
+            version,
+            periodos,
+            curvaAvance,
+            largo: labels.length,
+            itemsPorPlanificacion: planifItemsByPlanif,
+            costoPorItem: costoItemMap,
+            total: totalProyecto,
+          }),
+        }));
+
+        series.forEach((s, i) => {
+          planificacionesCurvas.push({
+            serie: `replanteo-${s.version.version}`,
+            tipo: "replanteo",
+            version: s.version.version,
+            motivo: s.version.motivo || "tiempo",
+            fecha_corte: s.version.fecha_corte,
+            esVigente: i === series.length - 1,
+            datos: s.datos,
+          });
+        });
+
+        planificadoVigente = planVigente({
+          planOriginal: curvaPlan,
+          series,
+          cantidadPeriodos: periodos.length,
         });
       } else {
         // Sin replanteos hay una sola serie: la planificación vigente.
         planificacionesCurvas.push({
           serie: "original",
           tipo: "original",
+          version: 0,
           esVigente: true,
           datos: [...curvaPlan],
         });
@@ -784,7 +816,7 @@ router.get(
 
       return res.json({
         labels,
-        planificado: curvaPlan,
+        planificado: planificadoVigente,
         certificado: curvaCert,
         avance: curvaAvance,
         certNumerosPorPeriodo,
@@ -961,10 +993,14 @@ router.get(
 router.get(
   "/:obraId/items-disponible-planificacion",
   authMiddleware,
+  hasRole([ROLES.ADMIN, ROLES.OPERATOR, ROLES.VIEWER]),
   async (req, res) => {
     try {
       const { obraId } = req.params;
 
+      // Solo cuenta el plan ORIGINAL. Antes sumaba también los replanteos, que
+      // replanifican lo mismo: un ítem replanteado aparecía planificado de más
+      // y desaparecía del formulario del original.
       const items = await PliegoItem.findAll({
         where: { obraId },
         include: [
@@ -972,12 +1008,13 @@ router.get(
             model: PlanificacionItem,
             as: "planificaciones",
             attributes: ["porcentaje_planificado"],
+            required: false,
             include: [
               {
                 model: Planificacion,
                 as: "planificacion",
                 attributes: [],
-                where: { obraId },
+                where: { obraId, version: 0 },
               },
             ],
           },
@@ -1152,7 +1189,7 @@ router.get("/:obraId/planificaciones", authMiddleware, hasRole([ROLES.ADMIN, ROL
 
     const planificaciones = await Planificacion.findAll({
       where: { obraId },
-      order: [["fecha_desde", "ASC"]],
+      order: [["version", "ASC"], ["fecha_desde", "ASC"]],
     });
     const planifIds = planificaciones.map((p) => p.id);
     const todosItems = planifIds.length
@@ -1164,34 +1201,54 @@ router.get("/:obraId/planificaciones", authMiddleware, hasRole([ROLES.ADMIN, ROL
       itemsByPlanif[i.planificacion_id].push(i);
     });
 
-    // Calcular % ponderado acumulado por mes
-    let acumulado = 0;
-    const result = planificaciones.map((p) => {
-      const items = itemsByPlanif[p.id] || [];
-      let ponderado = 0;
-      if (totalProyecto > 0) {
-        items.forEach((i) => {
-          const costo = costoMap[i.pliego_item_id] || 0;
-          ponderado += (Number(i.porcentaje_planificado || 0) / 100) * (costo / totalProyecto) * 100;
+    // El acumulado se lleva POR VERSIÓN. Antes era uno solo para todo, así que
+    // un replanteo se sumaba encima del original y el historial mostraba 197%.
+    // Un replanteo arranca desde el avance real a su fecha de corte: eso ya está
+    // hecho, y lo que planifica es lo que falta.
+    const versiones = agruparVersiones(planificaciones.map((p) => p.toJSON()));
+    const necesitaAvance = versiones.some((v) => v.version > 0);
+    let avances = [], avanceItems = [];
+    if (necesitaAvance) {
+      avances = await AvanceObra.findAll({ where: { obra_id: obraId }, raw: true });
+      avanceItems = avances.length
+        ? await AvanceObraItem.findAll({ where: { avance_obra_id: avances.map((a) => a.id) }, raw: true })
+        : [];
+    }
+    const ultimaVersion = versiones.length ? versiones[versiones.length - 1].version : 0;
+
+    const ponderar = (items) => totalProyecto > 0
+      ? items.reduce((s, i) => s + (Number(i.porcentaje_planificado || 0) / 100) * ((costoMap[i.pliego_item_id] || 0) / totalProyecto) * 100, 0)
+      : 0;
+
+    const result = [];
+    for (const v of versiones) {
+      let acumulado = 0;
+      if (v.version > 0 && totalProyecto > 0) {
+        const real = avancePorItemHasta(avances, avanceItems, v.fecha_corte);
+        acumulado = Object.entries(real).reduce(
+          (s, [id, pct]) => s + (Math.min(100, pct) / 100) * ((costoMap[id] || 0) / totalProyecto) * 100, 0
+        );
+      }
+      for (const p of v.filas) {
+        const ponderado = r2(ponderar(itemsByPlanif[p.id] || []));
+        acumulado += ponderado;
+        result.push({
+          id: p.id,
+          nombre: p.nombre,
+          fecha_desde: p.fecha_desde,
+          fecha_hasta: p.fecha_hasta,
+          estado: p.estado,
+          tipo: v.version === 0 ? "original" : "replanteo",
+          motivo: p.motivo || null,
+          version: v.version,
+          fecha_corte: v.fecha_corte,
+          es_vigente: v.version === ultimaVersion,
+          planificacion_padre_id: p.planificacion_padre_id || null,
+          total_porcentaje: ponderado,
+          total_porcentaje_acum: r2(acumulado),
         });
       }
-      ponderado = Number(ponderado.toFixed(2));
-      acumulado = Number((acumulado + ponderado).toFixed(2));
-      return {
-        id: p.id,
-        nombre: p.nombre,
-        fecha_desde: p.fecha_desde,
-        fecha_hasta: p.fecha_hasta,
-        estado: p.estado,
-        // El historial necesita estos dos para distinguir un replanteo de una
-        // planificación original y mostrar por qué se replanteó.
-        tipo: p.tipo || "original",
-        motivo: p.motivo || null,
-        planificacion_padre_id: p.planificacion_padre_id || null,
-        total_porcentaje: ponderado,
-        total_porcentaje_acum: acumulado,
-      };
-    });
+    }
     return res.json(result);
   } catch (error) {
     console.error("Error listando planificaciones:", error);
@@ -1204,8 +1261,8 @@ router.get("/:obraId/planificaciones", authMiddleware, hasRole([ROLES.ADMIN, ROL
 ====================================================== */
 router.get("/:obraId/planificaciones/:planifId", authMiddleware, hasRole([ROLES.ADMIN, ROLES.OPERATOR, ROLES.VIEWER]), async (req, res) => {
   try {
-    const { planifId } = req.params;
-    const planif = await Planificacion.findByPk(planifId);
+    const { obraId, planifId } = req.params;
+    const planif = await Planificacion.findOne({ where: { id: planifId, obraId } });
     if (!planif) return res.status(404).json({ message: "Planificación no encontrada" });
     const items = await PlanificacionItem.findAll({
       where: { planificacion_id: planifId },
@@ -1226,31 +1283,64 @@ router.put("/:obraId/planificacion/:planifId", authMiddleware, hasRole([ROLES.AD
   try {
     const { obraId, planifId } = req.params;
     const { fecha_desde, fecha_hasta, items } = req.body;
-    if (!fecha_desde || !fecha_hasta || !Array.isArray(items) || !items.length) {
-      await t.rollback();
-      return res.status(400).json({ message: "Datos incompletos para la planificación" });
-    }
-    const planif = await Planificacion.findByPk(planifId, { transaction: t });
+
+    // Se busca DENTRO de la obra: antes se podía editar una planificación de
+    // otra obra cambiando el número en la dirección.
+    const planif = await Planificacion.findOne({ where: { id: planifId, obraId }, transaction: t });
     if (!planif) { await t.rollback(); return res.status(404).json({ message: "Planificación no encontrada" }); }
-    const solapada = await Planificacion.findOne({
-      where: { obraId, id: { [Op.ne]: planifId }, [Op.or]: [
-        { fecha_desde: { [Op.between]: [fecha_desde, fecha_hasta] } },
-        { fecha_hasta: { [Op.between]: [fecha_desde, fecha_hasta] } },
-        { [Op.and]: [{ fecha_desde: { [Op.lte]: fecha_desde } }, { fecha_hasta: { [Op.gte]: fecha_hasta } }] },
-      ]},
-    });
-    if (solapada) { await t.rollback(); return res.status(400).json({ message: "Ya existe una planificación en ese período" }); }
-    await planif.update({ fecha_desde, fecha_hasta, nombre: `Planificación ${fecha_desde} → ${fecha_hasta}` }, { transaction: t });
-    await PlanificacionItem.destroy({ where: { planificacion_id: planifId }, transaction: t });
-    for (const item of items) {
-      await PlanificacionItem.create({ planificacion_id: planifId, pliego_item_id: item.pliego_item_id, porcentaje_planificado: item.porcentaje_planificado || 0 }, { transaction: t });
+
+    if (Number(planif.version || 0) > 0) {
+      await t.rollback();
+      return res.status(400).json({
+        message: "Esta planificación es parte de un replanteo. Se edita desde el replanteo, con todos sus meses.",
+      });
     }
+
+    // El solapamiento se controla solo contra los demás meses del original.
+    // Antes comparaba contra todo, y un replanteo —que pisa a propósito los
+    // meses que reemplaza— dejaba el mes original imposible de editar.
+    const error = await validarMesOriginal({ obraId, fecha_desde, fecha_hasta, items, transaction: t, excluirId: planif.id });
+    if (error) { await t.rollback(); return res.status(400).json({ message: error }); }
+
+    await planif.update({ fecha_desde, fecha_hasta, nombre: `Planificación ${fecha_desde} → ${fecha_hasta}` }, { transaction: t });
+    await PlanificacionItem.destroy({ where: { planificacion_id: planif.id }, transaction: t });
+    await PlanificacionItem.bulkCreate(
+      items
+        .filter((i) => Number(i.porcentaje_planificado) > 0)
+        .map((i) => ({ planificacion_id: planif.id, pliego_item_id: Number(i.pliego_item_id), porcentaje_planificado: r2(i.porcentaje_planificado) })),
+      { transaction: t }
+    );
     await t.commit();
     return res.json({ ok: true, message: "Planificación actualizada" });
   } catch (error) {
     await t.rollback();
     console.error("Error editando planificacion:", error);
-    return res.status(500).json({ message: error.message || "Error al editar planificación" });
+    return res.status(500).json({ message: "Error al editar planificación" });
+  }
+});
+
+/* ======================================================
+   🗑️ BORRAR UN MES DEL PLAN ORIGINAL
+   No existía: una planificación mal cargada quedaba para siempre.
+====================================================== */
+router.delete("/:obraId/planificacion/:planifId", authMiddleware, hasRole([ROLES.ADMIN, ROLES.OPERATOR]), async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const { obraId, planifId } = req.params;
+    const planif = await Planificacion.findOne({ where: { id: planifId, obraId }, transaction: t });
+    if (!planif) { await t.rollback(); return res.status(404).json({ message: "Planificación no encontrada" }); }
+    if (Number(planif.version || 0) > 0) {
+      await t.rollback();
+      return res.status(400).json({ message: "Este mes es parte de un replanteo. Se borra el replanteo completo." });
+    }
+    await PlanificacionItem.destroy({ where: { planificacion_id: planif.id }, transaction: t });
+    await planif.destroy({ transaction: t });
+    await t.commit();
+    return res.json({ ok: true, message: "Mes de planificación borrado" });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error borrando planificación:", error);
+    return res.status(500).json({ message: "Error al borrar la planificación" });
   }
 });
 
@@ -1416,14 +1506,14 @@ router.get("/:obraId/items-disponibles-avance", authMiddleware, hasRole([ROLES.A
 router.get(
   "/:obraId/items-disponible-replanteo",
   authMiddleware,
+  hasRole([ROLES.ADMIN, ROLES.OPERATOR, ROLES.VIEWER]),
   async (req, res) => {
     try {
       const { obraId } = req.params;
 
-      const items = await PliegoItem.findAll({
-        where: { obraId },
-        order: [["numeroItem", "ASC"]],
-      });
+      // Orden numérico: por texto, "10" quedaba antes que "2".
+      const items = (await PliegoItem.findAll({ where: { obraId } }))
+        .sort((a, b) => String(a.numeroItem).localeCompare(String(b.numeroItem), "es", { numeric: true }));
 
       // Último avance, para sugerirle al frontend desde cuándo replantear.
       const ultimoAvance = await AvanceObra.findOne({

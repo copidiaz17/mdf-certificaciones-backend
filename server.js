@@ -31,10 +31,11 @@ import pliegosRoutes from "./routes/pliegos.js";
 import catalogoRoutes from "./routes/catalogo.js";
 import certificacionesRoutes from "./routes/certificaciones.js";
 import avanceobraRoutes from "./routes/avanceObra.js";
+import usuariosRouter from "./routes/usuarios.js";
 import publicaRoutes from "./routes/publica.js";
 import subcontratosRoutes from "./routes/subcontratos.js";
 import informesAvanceRoutes from "./routes/informesAvance.js";
-import usuariosRouter from "./routes/usuarios.js";
+import replanteosRoutes from "./routes/replanteos.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -51,7 +52,6 @@ app.set("trust proxy", 1);
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const allowedOrigins = [
   FRONTEND_URL,
-  "https://mdf-certificaciones-frontend.onrender.com",
   "http://localhost:5173",
   "http://localhost:5174",
 ];
@@ -85,13 +85,15 @@ app.use("/api/obras", obrasRoutes);
 app.use("/api/obras", pliegosRoutes); // pliego-item CRUD bajo /api/obras
 app.use("/api/obras", subcontratosRoutes); // subcontratos bajo /api/obras
 app.use("/api/obras", informesAvanceRoutes); // informes de avance bajo /api/obras
+app.use("/api/obras", replanteosRoutes); // replanteo como versión del plan de trabajos
 app.use("/api/pliegos", pliegosRoutes);
 app.use("/api/catalogo", catalogoRoutes);
 app.use("/api/certificaciones", certificacionesRoutes);
 app.use("/api/avanceObra", avanceobraRoutes);
-// API entre sistemas: la consume el sistema de costos/contabilidad.
-app.use("/api/publica", publicaRoutes);
 app.use("/api/usuarios", usuariosRouter);
+// API entre sistemas: la consume el sistema de costos. Va cerrada con
+// token, y si falta API_TOKEN responde 503 en vez de quedar abierta.
+app.use("/api/publica", publicaRoutes);
 
 // Health / ping
 app.get("/", (req, res) => {
@@ -109,17 +111,6 @@ app.use((err, req, res, next) => {
 // ===============================================
 // 6. VALIDACIONES DE ENTORNO (AVISO)
 // ===============================================
-console.log("🔍 Variables de entorno cargadas:");
-console.log("   NODE_ENV:", process.env.NODE_ENV || "(no definido)");
-console.log("   PORT:", process.env.PORT || "(no definido)");
-console.log("   DB_HOST:", process.env.DB_HOST || "(no definido)");
-console.log("   DB_PORT:", process.env.DB_PORT || "(no definido)");
-console.log("   DB_NAME:", process.env.DB_NAME || "(no definido)");
-console.log("   DB_USER:", process.env.DB_USER || "(no definido)");
-console.log("   DB_PASSWORD:", process.env.DB_PASSWORD ? "✅ definido" : "❌ NO definido");
-console.log("   JWT_SECRET:", process.env.JWT_SECRET ? "✅ definido" : "❌ NO definido");
-console.log("   FRONTEND_URL:", process.env.FRONTEND_URL || "(no definido)");
-
 if (!process.env.JWT_SECRET) {
   console.error("⛔ JWT_SECRET no está definido. El servidor no puede arrancar de forma segura.");
   process.exit(1);
@@ -129,28 +120,30 @@ if (!process.env.FRONTEND_URL) {
 }
 
 // ===============================================
-// 7. CONECTAR DB + LEVANTAR SERVIDOR
+// 7. MIGRACIONES DE ESQUEMA
 // ===============================================
-console.log("🔄 Intentando conectar a la base de datos...");
+// La definicion del esquema vive en migraciones.mjs (un solo lugar).
+// Si una migracion falla, el arranque se corta: es preferible no levantar
+// a levantar con la base desactualizada y que nadie se entere.
 
+// ===============================================
+// 8. CONECTAR DB + LEVANTAR SERVIDOR
+// ===============================================
 sequelize
   .authenticate()
   .then(async () => {
     console.log("✅ Conexión a la base de datos OK");
 
-    // Sincronizar y migrar CAMBIAN el esquema. Contra una base remota desde
-    // una máquina de desarrollo eso es la forma más fácil de romper
-    // producción sin querer, y ya pasó una vez. El servidor atiende igual;
-    // lo único que no hace es tocar la estructura.
+    // sync() y migrar() CAMBIAN el esquema. Contra una base remota desde una
+    // maquina de desarrollo eso es la forma mas facil de romper produccion
+    // sin querer. El servidor atiende igual; lo unico que no hace es tocar la
+    // estructura. En Render va MIGRAR_EN_ARRANQUE=true.
     const guarda = avisarEnConsola();
     if (!guarda.permitido) return;
 
     await sequelize.sync();
-    console.log("✅ Tablas sincronizadas");
-
-    // El esquema se define en un solo lugar: migraciones.mjs.
-    // Si algo falla, el arranque se corta en vez de levantar con la base vieja.
     await migrar();
+    console.log("✅ Tablas sincronizadas");
   })
   .then(() => {
     app.listen(PORT, () => {
@@ -158,7 +151,6 @@ sequelize
     });
   })
   .catch((err) => {
-    console.error("⛔ Error de conexión DB:", err.message || err);
-    // Dar tiempo a que los logs se escriban antes de salir
-    setTimeout(() => process.exit(1), 1000);
+    console.error("⛔ Error de conexión DB:", err);
+    process.exit(1);
   });

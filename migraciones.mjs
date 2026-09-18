@@ -138,11 +138,45 @@ export async function migrar({ silencioso = false } = {}) {
     `SELECT COLUMN_TYPE t FROM INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'planificaciones' AND COLUMN_NAME = 'motivo'`
   );
-  if (tipoMotivo.length && !String(tipoMotivo[0].t).startsWith("enum")) {
+  //
+  // También agrega "ambos": la pantalla ofrecía "Extensión de plazo + Adicional"
+  // pero la columna no lo admitía y el motivo se guardaba vacío. Sumar un valor
+  // al final de un ENUM no toca los datos existentes.
+  const definicionMotivo = String(tipoMotivo[0]?.t || "");
+  if (tipoMotivo.length && (!definicionMotivo.startsWith("enum") || !definicionMotivo.includes("'ambos'"))) {
     await sequelize.query(
-      `ALTER TABLE planificaciones MODIFY COLUMN motivo ENUM('tiempo','adicional_item') NULL DEFAULT NULL`
+      `ALTER TABLE planificaciones MODIFY COLUMN motivo ENUM('tiempo','adicional_item','ambos') NULL DEFAULT NULL`
     );
-    log("   ✅ planificaciones.motivo unificada a ENUM");
+    log("   ✅ planificaciones.motivo: ENUM con 'ambos'");
+  }
+
+  // ── Replanteo como versión del plan de trabajos ──────────────────────────
+  await agregarColumna("planificaciones", "version", "INT NOT NULL DEFAULT 0", log);
+  await agregarColumna("planificaciones", "fecha_corte", "DATE NULL DEFAULT NULL", log);
+
+  // Los replanteos cargados antes de existir las versiones quedaron con
+  // version = 0, mezclados con el original. No hay forma de saber qué filas
+  // iban juntas, así que cada una pasa a ser su propia versión, en el orden en
+  // que se cargaron, con corte el día anterior a su mes.
+  if (await tablaExiste("planificaciones")) {
+    const [sueltos] = await sequelize.query(
+      `SELECT id, obra_id FROM planificaciones
+        WHERE tipo = 'replanteo' AND version = 0 ORDER BY obra_id, id`
+    );
+    for (const fila of sueltos) {
+      const [[{ siguiente }]] = await sequelize.query(
+        `SELECT COALESCE(MAX(version), 0) + 1 AS siguiente FROM planificaciones WHERE obra_id = :obra`,
+        { replacements: { obra: fila.obra_id } }
+      );
+      await sequelize.query(
+        `UPDATE planificaciones
+            SET version = :version,
+                fecha_corte = COALESCE(fecha_corte, DATE_SUB(fecha_desde, INTERVAL 1 DAY))
+          WHERE id = :id`,
+        { replacements: { version: siguiente, id: fila.id } }
+      );
+    }
+    if (sueltos.length) log(`   ✅ ${sueltos.length} replanteo(s) viejo(s) pasados a versión propia`);
   }
 
   log("✅ Esquema al día");

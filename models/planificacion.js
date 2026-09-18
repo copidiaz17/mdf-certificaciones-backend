@@ -47,8 +47,30 @@ const Planificacion = sequelize.define(
     },
 
     // Por qué se replantea: se atrasó la obra, o entraron ítems adicionales.
+    // "ambos" lo ofrecía la pantalla desde el principio, pero la columna no lo
+    // admitía y se guardaba vacío sin avisar.
     motivo: {
-      type: DataTypes.ENUM("tiempo", "adicional_item"),
+      type: DataTypes.ENUM("tiempo", "adicional_item", "ambos"),
+      allowNull: true,
+    },
+
+    // ── Versión del plan de trabajos ─────────────────────────────────────
+    // 0 es el plan original. Cada replanteo es una versión nueva (1, 2, ...)
+    // formada por TODOS sus meses, que se crean, editan y borran juntos.
+    //
+    // Sin esto el sistema no podía saber qué filas forman un mismo replanteo:
+    // replantear mes a mes volvía a ofrecer el mismo disponible en cada mes y
+    // la curva pasaba del 100%.
+    version: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+
+    // Hasta qué fecha manda el avance real. La versión rige desde el día
+    // siguiente: lo anterior al corte ya está ejecutado y no se replanifica.
+    fecha_corte: {
+      type: DataTypes.DATEONLY,
       allowNull: true,
     },
 
