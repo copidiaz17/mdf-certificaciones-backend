@@ -7,6 +7,10 @@
 //   · el "anterior" se copiaba a mano y en varios certificados no cerraba
 //   · al cambiar un precio, lo ya certificado se re-valuaba
 //
+// El sub NO tiene plan de trabajo: el avance se registra contra la OC. Lo que
+// se hace de más, o un rubro que no existía, se registra como ADICIONAL al
+// certificar, previa confirmación.
+//
 // OC de Loza:
 //   S1 Demolición de cubierta  332 m2 × 4.400    =  1.460.800   (del pliego)
 //   S2 Encadenados              40 m3 × 115.000  =  4.600.000   (del pliego)
@@ -50,6 +54,13 @@ const sql = async (q) => { const [r] = await sequelize.query(q); return r; };
 const SUF = "SC" + Date.now().toString().slice(-6);
 let obraId = null, otraObra = null, subId = null;
 const p = {}, s = {};
+
+// La OC tal como la devuelve el detalle, lista para mandarla de vuelta.
+const comoOC = (items) => items.map((it) => ({
+  id: it.id, pliego_item_id: it.pliego_item_id, numero: it.numero, descripcion: it.descripcion,
+  unidad: it.unidad, cantidad: it.cantidad, precio_unitario: it.precio_unitario, origen: it.origen,
+  tipo_adicional: it.tipo_adicional, item_origen_id: it.item_origen_id,
+}));
 
 try {
   console.log("=== Preparando la obra y su pliego ===");
@@ -95,6 +106,8 @@ try {
   check("el mismo ítem del pliego dos veces se rechaza", r.status === 400, `→ ${r.status}`);
   r = await req("POST", `/obras/${obraId}/subcontratos`, oc([{ descripcion: "Sin cantidad", cantidad: 0, precio_unitario: 10 }]));
   check("un ítem sin cantidad se rechaza", r.status === 400, `→ ${r.status}`);
+  r = await req("POST", `/obras/${obraId}/subcontratos`, oc([...itemsOC, { descripcion: "Extra", cantidad: 1, precio_unitario: 1, origen: "adicional" }]));
+  check("un adicional sin decir si es de más o nuevo se rechaza", r.status === 400, `→ ${r.status}`);
 
   r = await req("POST", `/obras/${obraId}/subcontratos`, oc(itemsOC));
   check("la OC se crea con 3 ítems del pliego y 1 propio", r.status === 201, `→ ${r.status} ${r.data?.message}`);
@@ -106,41 +119,26 @@ try {
   check("pero con cantidad y precio PROPIOS del sub", cerca(det.items.find((i) => i.id === s.S1)?.precio_unitario, 4400) && cerca(det.items.find((i) => i.id === s.S1)?.cantidad, 332));
   check("el ítem propio no tiene ítem de pliego", det.items.find((i) => i.id === s.S4)?.pliego_item_id === null);
   check("total del contrato $18.135.800", cerca(det.resumen.totales.contrato, 18135800), `→ ${det.resumen.totales.contrato}`);
+  check("sin certificados, avance 0 y todo pendiente", det.resumen.totales.avance === 0 && cerca(det.resumen.totales.pendiente, 18135800));
 
   r = await req("GET", `/obras/${obraId}/subcontratos-pliego`);
   check("el pliego marca en qué subcontrato ya está cada ítem",
     r.data.find((x) => x.id === p.P1)?.en_subcontratos?.[0]?.subcontratista === "Loza, Carlos");
 
-  // ─────────────────────────────────────────────────────────────────
-  console.log("\n=== El plan de trabajo, por período ===");
   r = await req("GET", `/obras/${obraId}/subcontratos/${subId}/plan`);
-  check("sin plan, propone quincenas desde el inicio", r.data.propuesto === true && r.data.periodos[0].desde === "2026-02-09" && r.data.periodos[0].hasta === "2026-02-22",
-    `→ ${JSON.stringify(r.data.periodos?.[0])}`);
-  const plan = [
-    { desde: "2026-02-09", hasta: "2026-02-22", items: [{ subcontrato_item_id: s.S1, cantidad: 332 }, { subcontrato_item_id: s.S3, cantidad: 300 }] },
-    { desde: "2026-02-23", hasta: "2026-03-08", items: [{ subcontrato_item_id: s.S3, cantidad: 500 }, { subcontrato_item_id: s.S2, cantidad: 20 }] },
-    { desde: "2026-03-09", hasta: "2026-03-22", items: [{ subcontrato_item_id: s.S2, cantidad: 20 }, { subcontrato_item_id: s.S4, cantidad: 3 }, { subcontrato_item_id: s.S3, cantidad: 1200 }] },
-  ];
-  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/plan`, {
-    periodos: plan.map((x, i) => (i === 2 ? { ...x, items: [...x.items.slice(0, 2), { subcontrato_item_id: s.S3, cantidad: 1300 }] } : x)),
-  });
-  check("planificar más de lo contratado se rechaza", r.status === 400, `→ ${r.status}`);
-  console.log(`     "${r.data?.message}"`);
-  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/plan`, { periodos: [plan[0], { ...plan[1], desde: "2026-02-20" }] });
-  check("dos períodos que se pisan se rechazan", r.status === 400, `→ ${r.status}`);
-  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/plan`, { periodos: plan });
-  check("el plan de 3 quincenas se guarda", r.status === 200, `→ ${r.status} ${r.data?.message}`);
+  check("el sub ya NO tiene plan de trabajo", r.status === 404, `→ ${r.status}`);
 
   // ─────────────────────────────────────────────────────────────────
   console.log("\n=== Certificado N° 1 ===");
   r = await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/nuevo`);
   check("la planilla en blanco sugiere N° 1 y la primera quincena", r.data.certificado.numero === 1 && r.data.certificado.desde === "2026-02-09" && r.data.certificado.hasta === "2026-02-22",
     `→ ${JSON.stringify(r.data.certificado)}`);
+  check("cada fila dice su clase", r.data.filas.every((f) => f.clase === "contrato"));
   r = await req("POST", `/obras/${obraId}/subcontratos/${subId}/certificados`, {
     desde: "2026-02-09", hasta: "2026-02-20",
     items: [{ subcontrato_item_id: s.S1, cantidad: 332 }, { subcontrato_item_id: s.S3, cantidad: 240 }],
   });
-  check("se certifica", r.status === 201 && r.data.numero === 1, `→ ${r.status} ${r.data?.message}`);
+  check("se certifica sin pedir confirmación (nada de más)", r.status === 201 && r.data.numero === 1, `→ ${r.status} ${r.data?.message}`);
   const c1 = r.data.id;
   let pl = (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c1}`)).data;
   check("importe del certificado $2.900.800", cerca(pl.totales.importe.actual, 2900800), `→ ${pl.totales.importe.actual}`);
@@ -148,11 +146,8 @@ try {
 
   // ─────────────────────────────────────────────────────────────────
   console.log("\n=== Cambia el precio del tabique (6.000 → 6.500) ===");
-  const conPrecioNuevo = det.items.map((it) => ({
-    id: it.id, pliego_item_id: it.pliego_item_id, numero: it.numero, descripcion: it.descripcion,
-    unidad: it.unidad, cantidad: it.cantidad, precio_unitario: it.id === s.S3 ? 6500 : it.precio_unitario, origen: it.origen,
-  }));
-  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}`, oc(conPrecioNuevo));
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}`,
+    oc(comoOC(det.items).map((it) => (it.id === s.S3 ? { ...it, precio_unitario: 6500 } : it))));
   check("el precio se actualiza", r.status === 200, `→ ${r.status} ${r.data?.message}`);
   pl = (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c1}`)).data;
   check("el certificado 1 NO se re-valúa: sigue en $2.900.800", cerca(pl.totales.importe.actual, 2900800), `→ ${pl.totales.importe.actual}`);
@@ -179,62 +174,99 @@ try {
   const c2 = r.data.id;
   pl = (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`)).data;
   const fS3 = pl.filas.find((f) => f.id === s.S3);
-  check("el ANTERIOR del tabique es lo del certificado 1 (240)", cerca(fS3.cantidad.anterior, 240), `→ ${fS3.cantidad.anterior}`);
-  check("con el importe al precio de ENTONCES ($1.440.000)", cerca(fS3.importe.anterior, 1440000), `→ ${fS3.importe.anterior}`);
-  check("lo actual se paga al precio nuevo: 190 × 6.500", cerca(fS3.importe.actual, 1235000), `→ ${fS3.importe.actual}`);
-  check("el acumulado suma lo pagado ($2.675.000), no 430 × 6.500", cerca(fS3.importe.acumulado, 2675000), `→ ${fS3.importe.acumulado}`);
+  check("el ANTERIOR del tabique es lo del certificado 1 (240)", cerca(fS3.anterior.cantidad, 240), `→ ${fS3.anterior.cantidad}`);
+  check("con el importe al precio de ENTONCES ($1.440.000)", cerca(fS3.anterior.importe, 1440000), `→ ${fS3.anterior.importe}`);
+  check("lo actual se paga al precio nuevo: 190 × 6.500", cerca(fS3.actual.importe, 1235000), `→ ${fS3.actual.importe}`);
+  check("el acumulado suma lo pagado ($2.675.000), no 430 × 6.500", cerca(fS3.anterior.importe + fS3.actual.importe, 2675000));
   check("importe del certificado $4.278.150", cerca(pl.totales.importe.actual, 4278150), `→ ${pl.totales.importe.actual}`);
   check("descuentos $245.000", cerca(pl.totales.descuentos, 245000), `→ ${pl.totales.descuentos}`);
   check("a pagar $4.033.150", cerca(pl.totales.a_pagar, 4033150), `→ ${pl.totales.a_pagar}`);
-  check("el ítem que no es del pliego también se certifica", cerca(pl.filas.find((f) => f.id === s.S4).cantidad.actual, 3));
+  check("el ítem que no es del pliego también se certifica", cerca(pl.filas.find((f) => f.id === s.S4).actual.cantidad, 3));
 
   // ─────────────────────────────────────────────────────────────────
-  console.log("\n=== Certificado N° 3: se hace MÁS de lo contratado ===");
-  r = await req("POST", `/obras/${obraId}/subcontratos/${subId}/certificados`, {
-    desde: "2026-03-09", hasta: "2026-03-20", items: [{ subcontrato_item_id: s.S1, cantidad: 10 }, { subcontrato_item_id: s.S3, cantidad: 300 }],
-  });
-  check("el excedente se registra (no se rechaza)", r.status === 201, `→ ${r.status}`);
-  check("y se avisa", r.data?.hay_excedentes === true && cerca(r.data?.avisos?.[0]?.excedente, 10), `→ ${JSON.stringify(r.data?.avisos)}`);
+  console.log("\n=== Certificado N° 3: se hace MÁS de lo contratado y un rubro nuevo ===");
+  const cert3 = {
+    desde: "2026-03-09", hasta: "2026-03-20",
+    items: [{ subcontrato_item_id: s.S1, cantidad: 10 }, { subcontrato_item_id: s.S3, cantidad: 300 }],
+    nuevos: [{ clave: "n1", descripcion: "Limpieza final de obra", unidad: "gl", cantidad: 1, precio_unitario: 80000 }],
+  };
+  r = await req("POST", `/obras/${obraId}/subcontratos/${subId}/certificados`, cert3);
+  check("sin confirmar, el servidor frena y pregunta (409)", r.status === 409 && r.data?.requiere_confirmacion === true, `→ ${r.status}`);
+  const exDeMas = r.data?.extras?.find((x) => x.tipo === "de_mas");
+  const exNuevo = r.data?.extras?.find((x) => x.tipo === "nuevo");
+  check("avisa que la demolición se carga 10 m2 de más", exDeMas?.subcontrato_item_id === s.S1 && cerca(exDeMas?.cantidad, 10) && /de más/.test(exDeMas?.mensaje || ""),
+    `→ ${JSON.stringify(exDeMas)}`);
+  check("y que la limpieza es un ítem nuevo", exNuevo?.descripcion === "Limpieza final de obra" && /ítem nuevo/.test(exNuevo?.mensaje || ""), `→ ${JSON.stringify(exNuevo)}`);
+  console.log(`     "${r.data?.message}"`);
+  r = await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/nuevo`);
+  check("no se guardó nada: el siguiente sigue siendo el N° 3", r.data.certificado.numero === 3);
+
+  r = await req("POST", `/obras/${obraId}/subcontratos/${subId}/certificados`, { ...cert3, confirmar_extras: true });
+  check("confirmado, se certifica", r.status === 201 && r.data.numero === 3, `→ ${r.status} ${r.data?.message}`);
+  check("y dice qué registró como adicional", r.data?.adicionales_registrados?.length === 2);
   const c3 = r.data.id;
 
   det = (await req("GET", `/obras/${obraId}/subcontratos/${subId}`)).data;
+  const nuevoItem = det.items.find((i) => i.descripcion === "Limpieza final de obra");
+  check("el rubro nuevo queda en la OC como adicional · ítem nuevo",
+    nuevoItem?.origen === "adicional" && nuevoItem?.tipo_adicional === "nuevo" && nuevoItem?.creado_en_certificado_id === c3 && cerca(nuevoItem?.cantidad, 1),
+    `→ ${JSON.stringify(nuevoItem)}`);
   const rS1 = det.resumen.items.find((i) => i.id === s.S1);
-  check("la demolición queda con 10 m2 de excedente", cerca(rS1.excedente, 10), `→ ${rS1.excedente}`);
-  check("valorizado $44.000", cerca(rS1.excedente_importe, 44000), `→ ${rS1.excedente_importe}`);
-  check("pero su avance no pasa del 100%", cerca(rS1.avance, 100), `→ ${rS1.avance}`);
-  check("las estadísticas cuentan el excedente", cerca(det.resumen.totales.excedentes, 44000) && det.resumen.totales.items_con_excedente === 1,
-    `→ ${det.resumen.totales.excedentes}`);
+  check("la demolición queda al 100%, sin pasarse", cerca(rS1.certificado, 332) && cerca(rS1.avance, 100), `→ ${rS1.certificado} / ${rS1.avance}`);
+  const vS1 = det.resumen.items.find((i) => i.id === `de-mas-${s.S1}`);
+  check("los 10 m2 de más son su propio renglón: adicional · cargado de más",
+    vS1?.virtual === true && vS1?.clase === "de_mas" && /de más/.test(vS1?.etiqueta) && cerca(vS1?.certificado, 10) && cerca(vS1?.total, 44000),
+    `→ ${JSON.stringify(vS1)}`);
+  check("y dice qué rubro agranda", vS1?.rubro_origen === "DEMOLICION DE CUBIERTA METALICA");
+  const rNuevo = det.resumen.items.find((i) => i.id === nuevoItem?.id);
+  check("el ítem nuevo aparece como tal", rNuevo?.clase === "nuevo" && /ítem nuevo/.test(rNuevo?.etiqueta) && cerca(rNuevo?.total, 80000));
 
-  console.log("\n=== Estadísticas: acordado, avanzado, pendiente ===");
-  const tot = det.resumen.totales;
-  const contrato = 1460800 + 4600000 + 13000000 + 75000; // con el tabique ya a 6.500
-  check("contrato $19.135.800", cerca(tot.contrato, contrato), `→ ${tot.contrato}`);
-  check("certificado = suma de lo pagado en los 3 certificados", cerca(tot.certificado, 2900800 + 4278150 + 44000 + 1950000), `→ ${tot.certificado}`);
+  pl = (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`)).data;
+  check("importe del certificado 3: 44.000 + 1.950.000 + 80.000", cerca(pl.totales.importe.actual, 2074000), `→ ${pl.totales.importe.actual}`);
+  check("la planilla separa lo de más ($44.000) y lo nuevo ($80.000)", cerca(pl.totales.de_mas, 44000) && cerca(pl.totales.nuevo, 80000),
+    `→ ${pl.totales.de_mas} / ${pl.totales.nuevo}`);
+
+  console.log("\n=== Estadísticas: acordado, avanzado, pendiente, adicionales ===");
+  let tot = det.resumen.totales;
+  const original = 1460800 + 4600000 + 13000000 + 75000; // con el tabique ya a 6.500
+  check("original de la OC $19.135.800", cerca(tot.original, original), `→ ${tot.original}`);
+  check("adicionales de más $44.000", cerca(tot.de_mas, 44000), `→ ${tot.de_mas}`);
+  check("adicionales nuevos $80.000", cerca(tot.nuevo, 80000), `→ ${tot.nuevo}`);
+  check("acordado a la fecha = los tres ($19.259.800)", cerca(tot.contrato, original + 44000 + 80000), `→ ${tot.contrato}`);
+  check("certificado = suma de lo pagado en los 3 certificados", cerca(tot.certificado, 2900800 + 4278150 + 2074000), `→ ${tot.certificado}`);
   check("descuentos $245.000 y neto pagado", cerca(tot.descuentos, 245000) && cerca(tot.neto_pagado, tot.certificado - 245000));
+  check("cuenta los renglones de más y nuevos", tot.renglones_de_mas === 1 && tot.renglones_nuevos === 1, `→ ${tot.renglones_de_mas} / ${tot.renglones_nuevos}`);
   const rS3 = det.resumen.items.find((i) => i.id === s.S3);
   check("tabique: 730 certificados, 1.270 pendientes", cerca(rS3.certificado, 730) && cerca(rS3.pendiente, 1270), `→ ${rS3.certificado} / ${rS3.pendiente}`);
   check("pendiente del tabique valorizado al precio vigente", cerca(rS3.pendiente_importe, 1270 * 6500), `→ ${rS3.pendiente_importe}`);
-  check("hay plan: planificado a hoy y desvío", tot.planificado_hoy !== null && tot.desvio !== null, `→ ${tot.planificado_hoy} / ${tot.desvio}`);
-  check("la curva del sub tiene un punto por período del plan", det.resumen.curva.length === 3 && det.resumen.curva[2].planificado <= 100.01,
-    `→ ${JSON.stringify(det.resumen.curva)}`);
-  check("el plan completo llega a 100%", cerca(det.resumen.curva[2].planificado, 100, 0.05), `→ ${det.resumen.curva[2].planificado}`);
+  check("avance real 48,67%", cerca(tot.avance, 48.67, 0.02), `→ ${tot.avance}`);
+  check("la curva tiene un punto por certificado, y sube", det.resumen.curva.length === 3
+    && det.resumen.curva[0].avance < det.resumen.curva[1].avance && cerca(det.resumen.curva[2].avance, tot.avance),
+    `→ ${JSON.stringify(det.resumen.curva.map((c) => c.avance))}`);
 
   // ─────────────────────────────────────────────────────────────────
-  console.log("\n=== Adicional a la OC ===");
-  const conAdicional = [
-    ...det.items.map((it) => ({ id: it.id, pliego_item_id: it.pliego_item_id, numero: it.numero, descripcion: it.descripcion,
-      unidad: it.unidad, cantidad: it.cantidad, precio_unitario: it.precio_unitario, origen: it.origen })),
-    { descripcion: "Adicional de excavación cimientos a mano", unidad: "m3", cantidad: 216.19, precio_unitario: 4600, origen: "adicional" },
-  ];
-  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}`, oc(conAdicional));
-  check("se agrega el adicional", r.status === 200, `→ ${r.status} ${r.data?.message}`);
+  console.log("\n=== Adicional cargado a mano en la OC ===");
+  const exc = { descripcion: "Adicional de excavación cimientos a mano", unidad: "m3", cantidad: 216.19, precio_unitario: 4600, origen: "adicional" };
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}`, oc([...comoOC(det.items), { ...exc, tipo_adicional: "de_mas" }]));
+  check("un adicional de más sin decir qué rubro agranda se rechaza", r.status === 400, `→ ${r.status}`);
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}`, oc([...comoOC(det.items), { ...exc, tipo_adicional: "de_mas", item_origen_id: p.P1 }]));
+  check("ni apuntando a algo que no es de este subcontrato", r.status === 400, `→ ${r.status}`);
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}`, oc([...comoOC(det.items), { ...exc, tipo_adicional: "de_mas", item_origen_id: s.S2 }]));
+  check("se agrega el adicional de más sobre los encadenados", r.status === 200, `→ ${r.status} ${r.data?.message}`);
   det = (await req("GET", `/obras/${obraId}/subcontratos/${subId}`)).data;
-  check("el contrato crece en $994.474", cerca(det.resumen.totales.contrato, contrato + 994474), `→ ${det.resumen.totales.contrato}`);
-  check("y se distingue: original vs adicionales", cerca(det.resumen.totales.contrato_original, contrato) && cerca(det.resumen.totales.adicionales, 994474));
-  check("el adicional va al final de la OC", det.items[det.items.length - 1].origen === "adicional");
+  tot = det.resumen.totales;
+  check("el acordado crece en $994.474", cerca(tot.contrato, original + 44000 + 80000 + 994474), `→ ${tot.contrato}`);
+  check("y suma a los adicionales de más", cerca(tot.de_mas, 44000 + 994474), `→ ${tot.de_mas}`);
+  const rExc = det.resumen.items.find((i) => i.descripcion === exc.descripcion);
+  check("el renglón dice que agranda los encadenados", rExc?.clase === "de_mas" && rExc?.rubro_origen === "ENCADENADOS HORIZONTAL Y VERTICAL", `→ ${JSON.stringify(rExc)}`);
+  check("los adicionales van al final de la OC", det.items.slice(-2).every((i) => i.origen === "adicional"));
+  check("editar la OC no pierde de qué certificado nació el ítem nuevo",
+    det.items.find((i) => i.id === nuevoItem.id)?.creado_en_certificado_id === c3);
 
-  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}`, oc(conAdicional.filter((i) => i.id !== s.S3)));
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}`, oc(comoOC(det.items).filter((i) => i.id !== s.S3)));
   check("no se puede sacar un ítem que ya tiene certificados", r.status === 400, `→ ${r.status}`);
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}`, oc(comoOC(det.items).filter((i) => i.id !== s.S2)));
+  check("ni el rubro que agranda un adicional", r.status === 400, `→ ${r.status}`);
 
   // ─────────────────────────────────────────────────────────────────
   console.log("\n=== Solo se corrige o anula el ÚLTIMO certificado ===");
@@ -244,16 +276,39 @@ try {
   check("corregir uno del medio se rechaza", r.status === 400, `→ ${r.status}`);
   r = await req("POST", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}/anular`);
   check("anular uno del medio se rechaza", r.status === 400, `→ ${r.status}`);
-  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`, {
-    desde: "2026-03-09", hasta: "2026-03-20", items: [{ subcontrato_item_id: s.S3, cantidad: 280 }],
-  });
-  check("el último se corrige", r.status === 200, `→ ${r.status} ${r.data?.message}`);
+
+  const corr = (items, extra = {}) => ({ desde: "2026-03-09", hasta: "2026-03-20", items, ...extra });
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`,
+    corr([{ subcontrato_item_id: s.S1, cantidad: 10 }, { subcontrato_item_id: s.S3, cantidad: 280 }, { subcontrato_item_id: nuevoItem.id, cantidad: 2 }]));
+  check("al corregir, lo de más vuelve a pedir confirmación", r.status === 409 && r.data.extras.length === 1 && r.data.extras[0].tipo === "de_mas",
+    `→ ${r.status} ${JSON.stringify(r.data?.extras)}`);
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`,
+    corr([{ subcontrato_item_id: s.S1, cantidad: 10 }, { subcontrato_item_id: s.S3, cantidad: 280 }, { subcontrato_item_id: nuevoItem.id, cantidad: 2 }], { confirmar_extras: true }));
+  check("confirmado, se corrige", r.status === 200, `→ ${r.status} ${r.data?.message}`);
+  det = (await req("GET", `/obras/${obraId}/subcontratos/${subId}`)).data;
+  check("el ítem nuevo acompaña: ahora son 2", cerca(det.items.find((i) => i.id === nuevoItem.id)?.cantidad, 2));
+
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`, corr([{ subcontrato_item_id: s.S3, cantidad: 280 }]));
+  check("sin nada de más ya no pregunta", r.status === 200, `→ ${r.status} ${r.data?.message}`);
+  det = (await req("GET", `/obras/${obraId}/subcontratos/${subId}`)).data;
+  check("llevado a cero, el ítem nuevo desaparece de la OC", !det.items.some((i) => i.id === nuevoItem.id));
+  check("y el renglón de más también", !det.resumen.items.some((i) => i.id === `de-mas-${s.S1}`) && cerca(det.resumen.totales.de_mas, 994474));
+
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`,
+    corr([{ subcontrato_item_id: s.S3, cantidad: 280 }], { nuevos: [{ descripcion: "Retiro de escombros", unidad: "viaje", cantidad: 4, precio_unitario: 30000 }], confirmar_extras: true }));
+  check("en la corrección también se puede agregar un ítem nuevo", r.status === 200, `→ ${r.status} ${r.data?.message}`);
+  det = (await req("GET", `/obras/${obraId}/subcontratos/${subId}`)).data;
+  const escombros = det.items.find((i) => i.descripcion === "Retiro de escombros");
+  check("y queda como nacido en el certificado 3", escombros?.creado_en_certificado_id === c3 && escombros?.tipo_adicional === "nuevo");
+
   r = await req("POST", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}/anular`);
-  check("y se anula", r.status === 200, `→ ${r.status}`);
+  check("el último se anula", r.status === 200 && r.data.items_quitados === 1, `→ ${r.status} ${JSON.stringify(r.data)}`);
+  det = (await req("GET", `/obras/${obraId}/subcontratos/${subId}`)).data;
+  check("y se lleva el ítem nuevo que había creado", !det.items.some((i) => i.descripcion === "Retiro de escombros"));
+  check("el adicional cargado a mano se queda", det.items.some((i) => i.descripcion === exc.descripcion));
   r = await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/nuevo`);
   check("el siguiente es el N° 4 y retoma después del N° 2", r.data.certificado.numero === 4 && r.data.certificado.desde === "2026-03-07",
     `→ ${JSON.stringify(r.data.certificado)}`);
-  det = (await req("GET", `/obras/${obraId}/subcontratos/${subId}`)).data;
   check("el anulado deja de contar", det.resumen.totales.certificados === 2 && cerca(det.resumen.items.find((i) => i.id === s.S3).certificado, 430));
 
   // ─────────────────────────────────────────────────────────────────
@@ -262,7 +317,7 @@ try {
   check("las curvas de la obra no cambiaron", JSON.stringify(curvaAntes.avance) === JSON.stringify(curvaDespues.avance)
     && JSON.stringify(curvaAntes.certificado) === JSON.stringify(curvaDespues.certificado));
   const lista = (await req("GET", `/obras/${obraId}/subcontratos`)).data;
-  check("la lista de la obra muestra el subcontrato con sus números", lista.length === 1 && lista[0].totales?.contrato > 0);
+  check("la lista de la obra muestra el subcontrato con sus números", lista.length === 1 && lista[0].totales?.contrato > 0 && lista[0].totales?.de_mas > 0);
 
   r = await req("DELETE", `/obras/${obraId}/subcontratos/${subId}`);
   check("un subcontrato con certificados no se borra", r.status === 400, `→ ${r.status}`);
@@ -275,8 +330,6 @@ try {
     await sql(`DELETE FROM subcontrato_descuentos WHERE certificado_id IN (SELECT id FROM subcontrato_certificados WHERE subcontrato_id = ${subId})`);
     await sql(`DELETE FROM subcontrato_certificado_items WHERE certificado_id IN (SELECT id FROM subcontrato_certificados WHERE subcontrato_id = ${subId})`);
     await sql(`DELETE FROM subcontrato_certificados WHERE subcontrato_id = ${subId}`);
-    await sql(`DELETE FROM subcontrato_plan_items WHERE plan_periodo_id IN (SELECT id FROM subcontrato_plan_periodos WHERE subcontrato_id = ${subId})`);
-    await sql(`DELETE FROM subcontrato_plan_periodos WHERE subcontrato_id = ${subId}`);
     await sql(`DELETE FROM subcontrato_items WHERE subcontrato_id = ${subId}`);
     await sql(`DELETE FROM subcontratos WHERE id = ${subId}`);
   }

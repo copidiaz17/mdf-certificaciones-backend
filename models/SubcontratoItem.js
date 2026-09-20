@@ -38,6 +38,24 @@ const SubcontratoItem = sequelize.define(
       defaultValue: "contrato",
     },
 
+    // Qué clase de adicional es. En la planilla de Excel todo figuraba como
+    // "Adicional", pero eran dos cosas distintas:
+    //   de_mas  más cantidad de un rubro que ya estaba en la OC
+    //           ("Adicional de excavación cimientos a mano")
+    //   nuevo   un rubro que no existía ("Descarga de materiales de Icaño")
+    tipo_adicional: {
+      type: DataTypes.ENUM("de_mas", "nuevo"),
+      allowNull: true,
+    },
+
+    // Para un adicional "de más": qué rubro de la OC agranda.
+    item_origen_id: { type: DataTypes.INTEGER, allowNull: true },
+
+    // Si el ítem nació al certificar (un rubro nuevo cargado directo en el
+    // certificado), cuál certificado lo creó. Su cantidad acordada es la que
+    // se certificó: si ese certificado se corrige o se anula, el ítem acompaña.
+    creado_en_certificado_id: { type: DataTypes.INTEGER, allowNull: true },
+
     orden: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
 
     // ⚠️ LEGADO: el modelo anterior guardaba acá un precio "por el ítem

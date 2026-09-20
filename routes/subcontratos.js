@@ -5,20 +5,22 @@
 //   GET    /obras/:obraId/subcontratos                         lista con estadísticas
 //   GET    /obras/:obraId/subcontratos-pliego                  pliego para armar la OC
 //   POST   /obras/:obraId/subcontratos                         crea la OC con sus ítems
-//   GET    /obras/:obraId/subcontratos/:subId                  detalle + estadísticas + curva
+//   GET    /obras/:obraId/subcontratos/:subId                  detalle + estadísticas
 //   PUT    /obras/:obraId/subcontratos/:subId                  edita la OC y sus ítems
 //   DELETE /obras/:obraId/subcontratos/:subId                  borra (si no tiene certificados)
-//   GET    /obras/:obraId/subcontratos/:subId/plan             plan de trabajo por período
-//   PUT    /obras/:obraId/subcontratos/:subId/plan             reemplaza el plan
 //   GET    /obras/:obraId/subcontratos/:subId/certificados/nuevo       planilla en blanco
 //   GET    /obras/:obraId/subcontratos/:subId/certificados/:certId     planilla de un certificado
 //   POST   /obras/:obraId/subcontratos/:subId/certificados             certifica un período
 //   PUT    /obras/:obraId/subcontratos/:subId/certificados/:certId     corrige el ÚLTIMO
 //   POST   /obras/:obraId/subcontratos/:subId/certificados/:certId/anular  anula el ÚLTIMO
 //
-// Antes el pago al sub salía del avance de obra de la empresa, con un único
-// precio "por el ítem terminado". Ahora tiene orden de compra propia, plan
-// propio y certificados propios, como en la planilla de Excel que se usa hoy.
+// El subcontratista NO tiene plan de trabajo: el avance se registra
+// directamente contra la orden de compra, como en la planilla de Excel.
+//
+// Los trabajos extra se registran como ADICIONAL al certificar, sin cargarlos
+// antes: si en un rubro se certifica más de lo contratado, o se agrega un
+// rubro que no existía, el servidor pide confirmación y recién ahí lo
+// registra, diciendo de qué clase es ("cargado de más" o "ítem nuevo").
 import express from "express";
 import { sequelize } from "../database.js";
 
@@ -26,7 +28,6 @@ import Obra from "../models/Obra.js";
 import PliegoItem from "../models/PliegoItem.js";
 import Subcontrato from "../models/Subcontrato.js";
 import SubcontratoItem from "../models/SubcontratoItem.js";
-import { SubcontratoPlanPeriodo, SubcontratoPlanItem } from "../models/SubcontratoPlan.js";
 import {
   SubcontratoCertificado, SubcontratoCertificadoItem, SubcontratoDescuento,
 } from "../models/SubcontratoCertificado.js";
@@ -34,8 +35,7 @@ import {
 import { authMiddleware } from "./auth.js";
 import { hasRole, ROLES } from "../middlewares/authorization.js";
 import {
-  planillaDe, resumenSubcontrato, totalContrato, generarPeriodos, sugerirPeriodo,
-  esFecha, norm, r2, r4,
+  planillaDe, resumenSubcontrato, sugerirPeriodo, esFecha, norm, r2, r4,
 } from "../utils/subcontratos.js";
 
 const router = express.Router();
@@ -45,6 +45,7 @@ const ESCRIBIR = hasRole([ROLES.ADMIN, ROLES.OPERATOR]);
 
 const ESTADOS = ["vigente", "finalizado", "anulado"];
 const PERIODICIDADES = ["quincenal", "semanal"];
+const TIPOS_ADICIONAL = ["de_mas", "nuevo"];
 const TIPOS_DESCUENTO = ["adelanto", "herramientas", "otro"];
 const TOLERANCIA = 0.0001;
 
@@ -76,7 +77,6 @@ async function cargar(obraId, subId, t) {
   const todos = await SubcontratoCertificado.findAll({
     where: { subcontrato_id: sub.id }, order: [["numero", "ASC"]], raw: true, transaction: t,
   });
-  const vigentes = todos.filter((c) => !c.anulado);
   const certIds = todos.map((c) => c.id);
   const certItems = certIds.length
     ? await SubcontratoCertificadoItem.findAll({ where: { certificado_id: certIds }, raw: true, transaction: t })
@@ -84,22 +84,14 @@ async function cargar(obraId, subId, t) {
   const descuentos = certIds.length
     ? await SubcontratoDescuento.findAll({ where: { certificado_id: certIds }, raw: true, transaction: t })
     : [];
-  const planPeriodos = await SubcontratoPlanPeriodo.findAll({
-    where: { subcontrato_id: sub.id }, order: [["numero", "ASC"]], raw: true, transaction: t,
-  });
-  const planItems = planPeriodos.length
-    ? await SubcontratoPlanItem.findAll({ where: { plan_periodo_id: planPeriodos.map((p) => p.id) }, raw: true, transaction: t })
-    : [];
 
   return {
     sub,
     items,
     todos,
-    vigentes,
+    vigentes: todos.filter((c) => !c.anulado),
     certItemsPorCert: agrupar(certItems, "certificado_id"),
     descuentosPorCert: agrupar(descuentos, "certificado_id"),
-    planPeriodos,
-    planItemsPorPeriodo: agrupar(planItems, "plan_periodo_id"),
   };
 }
 
@@ -109,9 +101,6 @@ function resumenDe(d) {
     certificados: d.vigentes,
     certItemsPorCert: d.certItemsPorCert,
     descuentos: d.vigentes.flatMap((c) => d.descuentosPorCert[c.id] || []),
-    planPeriodos: d.planPeriodos,
-    planItemsPorPeriodo: d.planItemsPorPeriodo,
-    hoy: hoyISO(),
   });
 }
 
@@ -129,10 +118,10 @@ const itemsPlanos = (items) => items.map((it) => ({
 
 /**
  * Valida la cabecera y los ítems de una OC. Devuelve { error } o los datos listos.
- * Los ítems del pliego se validan contra ESTA obra; los que no son del pliego
- * necesitan descripción.
+ * `existentes` son los ids de ítems que ya tiene el subcontrato: un adicional
+ * "de más" tiene que agrandar uno de ellos.
  */
-async function validarOC({ obraId, body, t }) {
+async function validarOC({ obraId, body, existentes = new Set(), t }) {
   const subcontratista = String(body.subcontratista || "").trim();
   if (!subcontratista) return { error: "Falta el nombre del subcontratista." };
   const periodicidad = body.periodicidad || "quincenal";
@@ -163,6 +152,21 @@ async function validarOC({ obraId, body, t }) {
     if (!Number.isFinite(cantidad) || cantidad <= 0) return { error: `El ítem "${descripcion}" necesita una cantidad mayor a 0.` };
     if (!Number.isFinite(precio) || precio < 0) return { error: `El ítem "${descripcion}" tiene un precio inválido.` };
 
+    const esAdicional = it.origen === "adicional";
+    let tipo = null, itemOrigen = null;
+    if (esAdicional) {
+      tipo = it.tipo_adicional;
+      if (!TIPOS_ADICIONAL.includes(tipo)) {
+        return { error: `El adicional "${descripcion}" tiene que decir si es un rubro cargado de más o un ítem nuevo.` };
+      }
+      if (tipo === "de_mas") {
+        itemOrigen = it.item_origen_id ? Number(it.item_origen_id) : null;
+        if (!itemOrigen || !existentes.has(itemOrigen)) {
+          return { error: `El adicional "${descripcion}" es de más: indicá qué rubro de la OC agranda.` };
+        }
+      }
+    }
+
     limpios.push({
       id: it.id ? Number(it.id) : null,
       pliego_item_id: pliegoId,
@@ -171,7 +175,9 @@ async function validarOC({ obraId, body, t }) {
       unidad: String(it.unidad || del?.unidadMedida || "").trim().slice(0, 30) || null,
       cantidad: r4(cantidad),
       precio_unitario: r2(precio),
-      origen: it.origen === "adicional" ? "adicional" : "contrato",
+      origen: esAdicional ? "adicional" : "contrato",
+      tipo_adicional: tipo,
+      item_origen_id: itemOrigen,
       orden: i,
     });
   }
@@ -267,7 +273,7 @@ router.post("/:obraId/subcontratos", authMiddleware, ESCRIBIR, async (req, res) 
 });
 
 /* ======================================================
-   DETALLE: OC, estadísticas, curva y certificados
+   DETALLE: OC, estadísticas y certificados
 ====================================================== */
 router.get("/:obraId/subcontratos/:subId", authMiddleware, LEER, async (req, res) => {
   try {
@@ -296,7 +302,6 @@ router.get("/:obraId/subcontratos/:subId", authMiddleware, LEER, async (req, res
       resumen: resumenDe(d),
       certificados,
       ultimo_certificado_id: d.vigentes[d.vigentes.length - 1]?.id || null,
-      tiene_plan: d.planPeriodos.length > 0,
     });
   } catch (error) {
     console.error("Error detalle subcontrato:", error);
@@ -317,10 +322,10 @@ router.put("/:obraId/subcontratos/:subId", authMiddleware, ESCRIBIR, async (req,
     const d = await cargar(obraId, subId, t);
     if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
 
-    const datos = await validarOC({ obraId, body: req.body, t });
+    const existentes = new Set(d.items.map((i) => i.id));
+    const datos = await validarOC({ obraId, body: req.body, existentes, t });
     if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
 
-    const existentes = new Map(d.items.map((i) => [i.id, i]));
     if (datos.items.some((i) => i.id && !existentes.has(i.id))) {
       await t.rollback();
       return res.status(400).json({ message: "Hay ítems que no son de este subcontrato." });
@@ -336,13 +341,14 @@ router.put("/:obraId/subcontratos/:subId", authMiddleware, ESCRIBIR, async (req,
       await t.rollback();
       return res.status(400).json({ message: `No se puede sacar el ítem "${trabado.descripcion}": ya tiene cantidades certificadas.` });
     }
+    const huerfano = datos.items.find((i) => i.item_origen_id && aBorrar.some((b) => b.id === i.item_origen_id));
+    if (huerfano) {
+      await t.rollback();
+      return res.status(400).json({ message: `El adicional "${huerfano.descripcion}" agranda un rubro que estás sacando.` });
+    }
 
     await d.sub.update(datos.cabecera, { transaction: t });
-    if (aBorrar.length) {
-      const ids = aBorrar.map((i) => i.id);
-      await SubcontratoPlanItem.destroy({ where: { subcontrato_item_id: ids }, transaction: t });
-      await SubcontratoItem.destroy({ where: { id: ids }, transaction: t });
-    }
+    if (aBorrar.length) await SubcontratoItem.destroy({ where: { id: aBorrar.map((i) => i.id) }, transaction: t });
     for (const it of datos.items) {
       const { id, ...campos } = it;
       if (id) await SubcontratoItem.update(campos, { where: { id }, transaction: t });
@@ -377,11 +383,6 @@ router.delete("/:obraId/subcontratos/:subId", authMiddleware, ESCRIBIR, async (r
       await SubcontratoCertificadoItem.destroy({ where: { certificado_id: certIds }, transaction: t });
       await SubcontratoCertificado.destroy({ where: { id: certIds }, transaction: t });
     }
-    const periodoIds = d.planPeriodos.map((p) => p.id);
-    if (periodoIds.length) {
-      await SubcontratoPlanItem.destroy({ where: { plan_periodo_id: periodoIds }, transaction: t });
-      await SubcontratoPlanPeriodo.destroy({ where: { id: periodoIds }, transaction: t });
-    }
     await SubcontratoItem.destroy({ where: { subcontrato_id: d.sub.id }, transaction: t });
     await d.sub.destroy({ transaction: t });
     await t.commit();
@@ -390,102 +391,6 @@ router.delete("/:obraId/subcontratos/:subId", authMiddleware, ESCRIBIR, async (r
     await t.rollback();
     console.error("Error borrando subcontrato:", error);
     return res.status(500).json({ message: "Error al borrar el subcontrato" });
-  }
-});
-
-/* ======================================================
-   PLAN DE TRABAJO por período
-====================================================== */
-router.get("/:obraId/subcontratos/:subId/plan", authMiddleware, LEER, async (req, res) => {
-  try {
-    const { obraId, subId } = req.params;
-    const d = await cargar(obraId, subId);
-    if (!d) return res.status(404).json({ message: "Subcontrato no encontrado" });
-
-    let periodos = d.planPeriodos.map((p) => ({
-      numero: p.numero, desde: norm(p.desde), hasta: norm(p.hasta),
-      items: (d.planItemsPorPeriodo[p.id] || []).map((pi) => ({
-        subcontrato_item_id: pi.subcontrato_item_id, cantidad: Number(pi.cantidad),
-      })),
-    }));
-    // Sin plan todavía: se proponen períodos desde el inicio del contrato.
-    const propuesto = !periodos.length;
-    if (propuesto) {
-      const inicio = d.sub.fecha_inicio || d.sub.fecha_contrato || hoyISO();
-      periodos = generarPeriodos({ inicio, periodicidad: d.sub.periodicidad, cantidad: d.sub.periodicidad === "semanal" ? 12 : 8 })
-        .map((p) => ({ ...p, items: [] }));
-    }
-
-    return res.json({
-      subcontrato: datosCabecera(d.sub),
-      items: itemsPlanos(d.items),
-      total_contrato: totalContrato(d.items),
-      periodos,
-      propuesto,
-    });
-  } catch (error) {
-    console.error("Error plan subcontrato:", error);
-    return res.status(500).json({ message: "Error al cargar el plan" });
-  }
-});
-
-router.put("/:obraId/subcontratos/:subId/plan", authMiddleware, ESCRIBIR, async (req, res) => {
-  const t = await sequelize.transaction();
-  const rechazar = async (message) => { await t.rollback(); return res.status(400).json({ message }); };
-  try {
-    const { obraId, subId } = req.params;
-    const d = await cargar(obraId, subId, t);
-    if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
-
-    const periodos = (Array.isArray(req.body.periodos) ? req.body.periodos : [])
-      .map((p) => ({ ...p, desde: norm(p.desde), hasta: norm(p.hasta) }))
-      .sort((a, b) => (a.desde < b.desde ? -1 : 1));
-    if (!periodos.length) return rechazar("El plan tiene que tener al menos un período.");
-
-    const itemsPorId = new Map(d.items.map((i) => [i.id, i]));
-    const totalPorItem = {};
-    for (let i = 0; i < periodos.length; i++) {
-      const p = periodos[i];
-      if (!esFecha(p.desde) || !esFecha(p.hasta) || p.desde > p.hasta) return rechazar("Hay un período con fechas inválidas.");
-      if (i > 0 && periodos[i - 1].hasta >= p.desde) return rechazar("Hay dos períodos del plan que se pisan.");
-      const vistos = new Set();
-      for (const pi of p.items || []) {
-        const id = Number(pi.subcontrato_item_id);
-        const cantidad = Number(pi.cantidad);
-        if (!itemsPorId.has(id)) return rechazar("Hay ítems que no son de este subcontrato.");
-        if (!Number.isFinite(cantidad) || cantidad < 0) return rechazar("Hay cantidades inválidas en el plan.");
-        if (vistos.has(id)) return rechazar("Un ítem aparece dos veces en el mismo período.");
-        vistos.add(id);
-        totalPorItem[id] = (totalPorItem[id] || 0) + cantidad;
-      }
-    }
-    // El plan reparte lo contratado: un ítem no puede planificarse de más.
-    for (const [id, total] of Object.entries(totalPorItem)) {
-      const it = itemsPorId.get(Number(id));
-      if (total > Number(it.cantidad) + TOLERANCIA) {
-        return rechazar(`El ítem "${it.descripcion}" tiene ${r4(total)} ${it.unidad || ""} planificados y el contrato dice ${r4(it.cantidad)}.`);
-      }
-    }
-
-    const viejos = d.planPeriodos.map((p) => p.id);
-    if (viejos.length) {
-      await SubcontratoPlanItem.destroy({ where: { plan_periodo_id: viejos }, transaction: t });
-      await SubcontratoPlanPeriodo.destroy({ where: { id: viejos }, transaction: t });
-    }
-    for (const [i, p] of periodos.entries()) {
-      const fila = await SubcontratoPlanPeriodo.create(
-        { subcontrato_id: d.sub.id, numero: i + 1, desde: p.desde, hasta: p.hasta }, { transaction: t }
-      );
-      const items = (p.items || []).filter((pi) => Number(pi.cantidad) > 0)
-        .map((pi) => ({ plan_periodo_id: fila.id, subcontrato_item_id: Number(pi.subcontrato_item_id), cantidad: r4(pi.cantidad) }));
-      if (items.length) await SubcontratoPlanItem.bulkCreate(items, { transaction: t });
-    }
-    await t.commit();
-    return res.json({ ok: true, message: "Plan guardado" });
-  } catch (error) {
-    await t.rollback();
-    console.error("Error guardando plan subcontrato:", error);
-    return res.status(500).json({ message: "Error al guardar el plan" });
   }
 });
 
@@ -550,6 +455,9 @@ router.get("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, 
 /**
  * Valida un certificado. `anteriorHasta` es el cierre del certificado previo:
  * los períodos no se pueden pisar.
+ *
+ * `nuevos` son rubros que no estaban en la OC y se cargan directo en el
+ * certificado: se registran como adicional "ítem nuevo".
  */
 function validarCertificado({ body, d, anteriorHasta }) {
   const desde = norm(body.desde);
@@ -570,7 +478,25 @@ function validarCertificado({ body, d, anteriorHasta }) {
     if (!Number.isFinite(cantidad) || cantidad < 0) return { error: "Hay cantidades inválidas." };
     if (vistos.has(id)) return { error: "Un ítem aparece dos veces en el certificado." };
     vistos.add(id);
-    if (cantidad > 0) items.push({ id, cantidad: r4(cantidad) });
+    items.push({ id, cantidad: r4(cantidad) });
+  }
+
+  const nuevos = [];
+  const claves = new Set();
+  for (const n of Array.isArray(body.nuevos) ? body.nuevos : []) {
+    const descripcion = String(n.descripcion || "").trim();
+    const cantidad = Number(n.cantidad);
+    const precio = Number(n.precio_unitario);
+    const clave = String(n.clave || descripcion);
+    if (!descripcion) return { error: "Un ítem nuevo necesita descripción." };
+    if (!Number.isFinite(cantidad) || cantidad <= 0) return { error: `El ítem nuevo "${descripcion}" necesita una cantidad mayor a 0.` };
+    if (!Number.isFinite(precio) || precio < 0) return { error: `El ítem nuevo "${descripcion}" tiene un precio inválido.` };
+    if (claves.has(clave)) return { error: `El ítem nuevo "${descripcion}" está repetido.` };
+    claves.add(clave);
+    nuevos.push({
+      clave, descripcion: descripcion.slice(0, 600), unidad: String(n.unidad || "").trim().slice(0, 30) || null,
+      numero: String(n.numero || "").trim() || null, cantidad: r4(cantidad), precio_unitario: r2(precio),
+    });
   }
 
   const descuentos = [];
@@ -583,53 +509,94 @@ function validarCertificado({ body, d, anteriorHasta }) {
     descuentos.push({ tipo, concepto: concepto || null, importe: r2(importe) });
   }
 
-  if (!items.length && !descuentos.length) return { error: "El certificado está vacío: cargá cantidades o descuentos." };
-  return { desde, hasta, fecha: body.fecha ? norm(body.fecha) : null, observaciones: body.observaciones || null, items, descuentos };
+  if (!items.some((i) => i.cantidad > 0) && !nuevos.length && !descuentos.length) {
+    return { error: "El certificado está vacío: cargá cantidades, ítems nuevos o descuentos." };
+  }
+  return {
+    desde, hasta, fecha: body.fecha ? norm(body.fecha) : null, observaciones: body.observaciones || null,
+    items, nuevos, descuentos,
+  };
 }
 
-/** Excedentes que produce el certificado: se avisan, no se rechazan. */
-function avisosDeExcedente(d, datos, excluirCertId) {
+/**
+ * Lo que este certificado registraría como ADICIONAL: rubros que superan lo
+ * contratado ("cargado de más") y rubros que no existían ("ítem nuevo").
+ * Los ítems que nacieron en este mismo certificado no cuentan: su cantidad
+ * acordada es justamente la que se certifica.
+ */
+function extrasDe(d, datos, cert) {
   const previo = {};
   for (const c of d.vigentes) {
-    if (c.id === excluirCertId) continue;
+    if (cert && c.id === cert.id) continue;
     for (const ci of d.certItemsPorCert[c.id] || []) {
       previo[ci.subcontrato_item_id] = (previo[ci.subcontrato_item_id] || 0) + Number(ci.cantidad);
     }
   }
-  const avisos = [];
+  const extras = [];
   for (const ci of datos.items) {
+    if (ci.cantidad <= 0) continue;
     const it = d.items.find((i) => i.id === ci.id);
-    const acum = (previo[ci.id] || 0) + ci.cantidad;
-    const exced = acum - Number(it.cantidad);
+    if (cert && it.creado_en_certificado_id === cert.id) continue;
+    const exced = (previo[ci.id] || 0) + ci.cantidad - Number(it.cantidad);
     if (exced > TOLERANCIA) {
-      avisos.push({
+      extras.push({
+        tipo: "de_mas",
         subcontrato_item_id: it.id,
         descripcion: it.descripcion,
-        excedente: r4(exced),
-        mensaje: `"${it.descripcion}": el acumulado (${r4(acum)} ${it.unidad || ""}) supera lo contratado (${r4(it.cantidad)}). Quedan ${r4(exced)} ${it.unidad || ""} como excedente.`,
+        unidad: it.unidad,
+        cantidad: r4(exced),
+        mensaje: `"${it.descripcion}": se está cargando ${r4(exced)} ${it.unidad || ""} de más sobre lo contratado (${r4(it.cantidad)}). Se registra como adicional: cargado de más.`,
       });
     }
   }
-  return avisos;
+  for (const n of datos.nuevos) {
+    extras.push({
+      tipo: "nuevo",
+      descripcion: n.descripcion,
+      unidad: n.unidad,
+      cantidad: n.cantidad,
+      mensaje: `"${n.descripcion}" no está en la orden de compra. Se registra como adicional: ítem nuevo (${n.cantidad} ${n.unidad || ""}).`,
+    });
+  }
+  return extras;
 }
 
-async function guardarItemsYDescuentos({ cert, datos, d, preciosPrevios, t }) {
-  const itemsPorId = new Map(d.items.map((i) => [i.id, i]));
-  if (datos.items.length) {
+/** Si hay extras sin confirmar, se frena y se le devuelve a la pantalla qué preguntar. */
+function pedirConfirmacion(res, extras) {
+  return res.status(409).json({
+    requiere_confirmacion: true,
+    extras,
+    message: extras.length === 1
+      ? "Hay un trabajo extra en este certificado. ¿Lo registramos como adicional?"
+      : `Hay ${extras.length} trabajos extra en este certificado. ¿Los registramos como adicionales?`,
+  });
+}
+
+/** Crea los ítems nuevos (adicional "ítem nuevo") nacidos en este certificado. */
+async function crearNuevos({ d, datos, cert, t }) {
+  const orden = d.items.reduce((m, i) => Math.max(m, i.orden), 0);
+  const creados = [];
+  for (const [k, n] of datos.nuevos.entries()) {
+    const item = await SubcontratoItem.create({
+      subcontrato_id: d.sub.id, pliego_item_id: null, numero: n.numero, descripcion: n.descripcion,
+      unidad: n.unidad, cantidad: n.cantidad, precio_unitario: n.precio_unitario,
+      origen: "adicional", tipo_adicional: "nuevo", creado_en_certificado_id: cert.id, orden: orden + k + 1,
+    }, { transaction: t });
+    creados.push({ id: item.id, cantidad: n.cantidad, precio_unitario: n.precio_unitario });
+  }
+  return creados;
+}
+
+async function guardarLineas({ cert, lineas, descuentos, t }) {
+  const conCantidad = lineas.filter((l) => l.cantidad > 0);
+  if (conCantidad.length) {
     await SubcontratoCertificadoItem.bulkCreate(
-      datos.items.map((ci) => ({
-        certificado_id: cert.id,
-        subcontrato_item_id: ci.id,
-        cantidad: ci.cantidad,
-        // Se congela el precio: el que ya tenía esa línea si se está
-        // corrigiendo, o el vigente del ítem si es nueva.
-        precio_unitario: preciosPrevios[ci.id] ?? Number(itemsPorId.get(ci.id).precio_unitario),
-      })),
+      conCantidad.map((l) => ({ certificado_id: cert.id, subcontrato_item_id: l.id, cantidad: l.cantidad, precio_unitario: l.precio_unitario })),
       { transaction: t }
     );
   }
-  if (datos.descuentos.length) {
-    await SubcontratoDescuento.bulkCreate(datos.descuentos.map((x) => ({ ...x, certificado_id: cert.id })), { transaction: t });
+  if (descuentos.length) {
+    await SubcontratoDescuento.bulkCreate(descuentos.map((x) => ({ ...x, certificado_id: cert.id })), { transaction: t });
   }
 }
 
@@ -645,16 +612,31 @@ router.post("/:obraId/subcontratos/:subId/certificados", authMiddleware, ESCRIBI
     const datos = validarCertificado({ body: req.body, d, anteriorHasta: ultimo ? norm(ultimo.hasta) : null });
     if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
 
+    const extras = extrasDe(d, datos, null);
+    if (extras.length && req.body.confirmar_extras !== true) { await t.rollback(); return pedirConfirmacion(res, extras); }
+
     const numero = d.todos.reduce((m, c) => Math.max(m, c.numero), 0) + 1;
     const cert = await SubcontratoCertificado.create({
       subcontrato_id: d.sub.id, numero, desde: datos.desde, hasta: datos.hasta,
       fecha: datos.fecha || hoyISO(), observaciones: datos.observaciones, creado_por_id: req.user?.id || null,
     }, { transaction: t });
-    await guardarItemsYDescuentos({ cert, datos, d, preciosPrevios: {}, t });
 
-    const avisos = avisosDeExcedente(d, datos, null);
+    const itemsPorId = new Map(d.items.map((i) => [i.id, i]));
+    const nuevos = await crearNuevos({ d, datos, cert, t });
+    await guardarLineas({
+      cert, t, descuentos: datos.descuentos,
+      lineas: [
+        // Precio congelado: el vigente del ítem al certificar.
+        ...datos.items.map((l) => ({ ...l, precio_unitario: Number(itemsPorId.get(l.id).precio_unitario) })),
+        ...nuevos,
+      ],
+    });
+
     await t.commit();
-    return res.status(201).json({ ok: true, id: cert.id, numero, avisos, hay_excedentes: avisos.length > 0, message: `Certificado N° ${numero} guardado` });
+    return res.status(201).json({
+      ok: true, id: cert.id, numero, adicionales_registrados: extras,
+      message: `Certificado N° ${numero} guardado${extras.length ? ` con ${extras.length} adicional(es)` : ""}`,
+    });
   } catch (error) {
     await t.rollback();
     console.error("Error creando certificado de subcontrato:", error);
@@ -681,6 +663,9 @@ router.put("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, 
     const datos = validarCertificado({ body: req.body, d, anteriorHasta: previo ? norm(previo.hasta) : null });
     if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
 
+    const extras = extrasDe(d, datos, cert);
+    if (extras.length && req.body.confirmar_extras !== true) { await t.rollback(); return pedirConfirmacion(res, extras); }
+
     const preciosPrevios = Object.fromEntries(
       (d.certItemsPorCert[cert.id] || []).map((ci) => [ci.subcontrato_item_id, Number(ci.precio_unitario)])
     );
@@ -690,11 +675,34 @@ router.put("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, 
     );
     await SubcontratoCertificadoItem.destroy({ where: { certificado_id: cert.id }, transaction: t });
     await SubcontratoDescuento.destroy({ where: { certificado_id: cert.id }, transaction: t });
-    await guardarItemsYDescuentos({ cert, datos, d, preciosPrevios, t });
 
-    const avisos = avisosDeExcedente(d, datos, cert.id);
+    // Los ítems nuevos que nacieron en este certificado acompañan la
+    // corrección: su cantidad acordada es la certificada, y si se lleva a
+    // cero, el ítem desaparece.
+    const itemsPorId = new Map(d.items.map((i) => [i.id, i]));
+    const cantidadPorId = new Map(datos.items.map((l) => [l.id, l.cantidad]));
+    const nacidos = d.items.filter((i) => i.creado_en_certificado_id === cert.id);
+    const aBorrar = [];
+    for (const it of nacidos) {
+      const q = cantidadPorId.get(it.id) || 0;
+      if (q > 0) await SubcontratoItem.update({ cantidad: q }, { where: { id: it.id }, transaction: t });
+      else aBorrar.push(it.id);
+    }
+    if (aBorrar.length) await SubcontratoItem.destroy({ where: { id: aBorrar }, transaction: t });
+
+    const nuevos = await crearNuevos({ d, datos, cert, t });
+    await guardarLineas({
+      cert, t, descuentos: datos.descuentos,
+      lineas: [
+        ...datos.items.filter((l) => !aBorrar.includes(l.id)).map((l) => ({
+          ...l, precio_unitario: preciosPrevios[l.id] ?? Number(itemsPorId.get(l.id).precio_unitario),
+        })),
+        ...nuevos,
+      ],
+    });
+
     await t.commit();
-    return res.json({ ok: true, avisos, hay_excedentes: avisos.length > 0, message: `Certificado N° ${cert.numero} corregido` });
+    return res.json({ ok: true, adicionales_registrados: extras, message: `Certificado N° ${cert.numero} corregido` });
   } catch (error) {
     await t.rollback();
     console.error("Error editando certificado de subcontrato:", error);
@@ -714,9 +722,17 @@ router.post("/:obraId/subcontratos/:subId/certificados/:certId/anular", authMidd
       await t.rollback();
       return res.status(400).json({ message: "Solo se puede anular el último certificado." });
     }
+
+    // Los ítems nuevos que nacieron en este certificado se van con él: no
+    // tienen nada certificado en otro lado.
+    const nacidos = d.items.filter((i) => i.creado_en_certificado_id === cert.id).map((i) => i.id);
+    if (nacidos.length) {
+      await SubcontratoCertificadoItem.destroy({ where: { certificado_id: cert.id, subcontrato_item_id: nacidos }, transaction: t });
+      await SubcontratoItem.destroy({ where: { id: nacidos }, transaction: t });
+    }
     await SubcontratoCertificado.update({ anulado: true }, { where: { id: cert.id }, transaction: t });
     await t.commit();
-    return res.json({ ok: true, message: `Certificado N° ${cert.numero} anulado` });
+    return res.json({ ok: true, message: `Certificado N° ${cert.numero} anulado`, items_quitados: nacidos.length });
   } catch (error) {
     await t.rollback();
     console.error("Error anulando certificado de subcontrato:", error);

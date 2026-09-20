@@ -198,6 +198,11 @@ export async function migrar({ silencioso = false } = {}) {
   // Un ítem que el pliego no tiene ("descarga de materiales") no tiene ítem
   // de pliego: la columna pasa a admitir nulos.
   await ajustarColumna("subcontrato_items", "pliego_item_id", "INT NULL DEFAULT NULL", log);
+  // Qué clase de adicional es: más cantidad de un rubro existente, o un rubro
+  // que no existía. Y de dónde salió.
+  await agregarColumna("subcontrato_items", "tipo_adicional", "ENUM('de_mas','nuevo') NULL DEFAULT NULL", log);
+  await agregarColumna("subcontrato_items", "item_origen_id", "INT NULL DEFAULT NULL", log);
+  await agregarColumna("subcontrato_items", "creado_en_certificado_id", "INT NULL DEFAULT NULL", log);
 
   log("✅ Esquema al día");
 }
