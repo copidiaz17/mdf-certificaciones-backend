@@ -37,6 +37,7 @@ NODE_ENV=development DB_HOST=localhost DB_PORT=3306 \
 | `excedentes.mjs` | El avance puede superar el pliego, avisa, y el excedente queda en cantidad |
 | `excedente-a-item.mjs` | Convertir el excedente en un ítem nuevo sin precio, y la API entre sistemas |
 | `avance-ruta-real.mjs` | La ruta que USA la aplicación (`POST /obras/:id/avances`), que es distinta de `/avanceObra` |
+| `curva-mensual.mjs` | La curva de avance es mensual también después del último mes planificado (las quincenas no abren puntos propios), el planificado se corta donde termina el plan y la certificación anulada no suma |
 | `anular-certificacion.mjs` | Anular una certificación y que deje de contar |
 | `informe-avance.mjs` | El informe de avance y los trabajos que no estaban en el pliego |
 | `fotos-informe.mjs` | Las fotos del informe |

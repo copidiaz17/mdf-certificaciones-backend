@@ -355,57 +355,6 @@ router.get(
         });
       }
 
-      // 2.1) EJE MENSUAL
-      // El avance de obra se puede cargar por quincena, pero en la curva las dos
-      // quincenas de un mes suman UN SOLO punto mensual, igual que lo planificado
-      // y lo certificado. Antes el eje se abría en dos puntos por mes y la
-      // planificación caía en la segunda quincena, así que las tres curvas se
-      // comparaban sobre ejes distintos.
-      //
-      // La curva es ACUMULADA: un mes sin movimiento queda plano, no cortado.
-      const ULTIMO_DIA = (a, m) => new Date(a, m, 0).getDate();
-      const aFecha = (a, m, d) => `${a}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
-
-      // Rango a cubrir: desde la primera planificación hasta la última, más
-      // cualquier avance o certificación que caiga fuera de ese rango.
-      const fechasRelevantes = [
-        ...planificaciones.map((p) => norm(p.fecha_desde)),
-        ...planificaciones.map((p) => norm(p.fecha_hasta)),
-      ].filter(Boolean).sort();
-
-      const primera = fechasRelevantes[0];
-      const ultima = fechasRelevantes[fechasRelevantes.length - 1];
-
-      const periodos = [];
-      let [anioCur, mesCur] = [Number(primera.slice(0, 4)), Number(primera.slice(5, 7))];
-      const [anioFin, mesFin] = [Number(ultima.slice(0, 4)), Number(ultima.slice(5, 7))];
-
-      while (anioCur < anioFin || (anioCur === anioFin && mesCur <= mesFin)) {
-        periodos.push({
-          fecha_desde: aFecha(anioCur, mesCur, 1),
-          fecha_hasta: aFecha(anioCur, mesCur, ULTIMO_DIA(anioCur, mesCur)),
-          anio: anioCur,
-          mes: mesCur,
-          planifIds: [],
-        });
-        mesCur++;
-        if (mesCur > 12) { mesCur = 1; anioCur++; }
-      }
-
-      // Cada cosa se imputa al mes en el que TERMINA: un período se reconoce
-      // cuando cierra. Un avance del 1 al 15 y otro del 16 al 30 caen los dos
-      // en el mismo mes y se suman.
-      const quincenaDe = (fechaHasta) => {
-        const f = norm(fechaHasta);
-        if (!f) return -1;
-        return periodos.findIndex((p) => f >= p.fecha_desde && f <= p.fecha_hasta);
-      };
-
-      planificaciones.forEach((p) => {
-        const i = quincenaDe(p.fecha_hasta);
-        if (i >= 0) periodos[i].planifIds.push(p.id);
-      });
-
       // La curva "planificado" base es SOLO el plan original (versión 0). Antes
       // sumaba también los replanteos, que pisan los mismos meses, y llegaba a
       // casi el doble del 100%.
@@ -427,8 +376,10 @@ router.get(
       });
 
       // 4) Certificaciones + items
+      // Las anuladas no cuentan, igual que en el acumulado del 100%: antes
+      // seguían sumando en la curva certificada y en la financiera.
       const certificaciones = await Certificacion.findAll({
-        where: { obra_id: obraId },
+        where: { obra_id: obraId, anulada: false },
         order: [["periodo_desde", "ASC"], ["id", "ASC"]],
         attributes: ["id", "numero_certificado", "total_neto", "periodo_desde", "periodo_hasta"],
         raw: true,
@@ -467,6 +418,76 @@ router.get(
         });
       }
 
+      // 5.1) EJE MENSUAL
+      // El avance de obra se puede cargar por quincena, pero en la curva las dos
+      // quincenas de un mes suman UN SOLO punto mensual, igual que lo planificado
+      // y lo certificado. Antes el eje se abría en dos puntos por mes y la
+      // planificación caía en la segunda quincena, así que las tres curvas se
+      // comparaban sobre ejes distintos.
+      //
+      // El eje va del primer al último mes con plan, avance o certificado. Antes
+      // cubría solo la planificación, y lo que cerraba después —una obra
+      // atrasada que sigue avanzando— se dibujaba aparte, un punto por cada
+      // carga: con el avance quincenal, ese tramo de la curva volvía a ser
+      // quincenal.
+      //
+      // La curva es ACUMULADA: un mes sin movimiento queda plano, no cortado.
+      const ULTIMO_DIA = (a, m) => new Date(a, m, 0).getDate();
+      const aFecha = (a, m, d) => `${a}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      const esFecha = (f) => /^(19|20)\d\d-(0[1-9]|1[0-2])-\d\d$/.test(f);
+
+      // Cada avance y cada certificado se imputan a la fecha en que cierran
+      // (ver más abajo), así que esa es la que tiene que entrar en el eje.
+      const cierreDeAvance = (a) =>
+        norm(a.periodo_desde) && norm(a.periodo_hasta) ? norm(a.periodo_hasta) : norm(a.fecha_avance);
+
+      const fechasRelevantes = [
+        ...planificaciones.map((p) => norm(p.fecha_desde)),
+        ...planificaciones.map((p) => norm(p.fecha_hasta)),
+        ...certificaciones
+          .filter((c) => norm(c.periodo_desde))
+          .map((c) => norm(c.periodo_hasta)),
+        ...avances.map(cierreDeAvance),
+      ].filter(esFecha).sort();
+
+      const primera = fechasRelevantes[0];
+      const ultima = fechasRelevantes[fechasRelevantes.length - 1];
+
+      const periodos = [];
+      let [anioCur, mesCur] = [Number(primera.slice(0, 4)), Number(primera.slice(5, 7))];
+      const [anioFin, mesFin] = [Number(ultima.slice(0, 4)), Number(ultima.slice(5, 7))];
+
+      while (anioCur < anioFin || (anioCur === anioFin && mesCur <= mesFin)) {
+        periodos.push({
+          fecha_desde: aFecha(anioCur, mesCur, 1),
+          fecha_hasta: aFecha(anioCur, mesCur, ULTIMO_DIA(anioCur, mesCur)),
+          anio: anioCur,
+          mes: mesCur,
+          planifIds: [],
+        });
+        mesCur++;
+        if (mesCur > 12) { mesCur = 1; anioCur++; }
+      }
+
+      // Cada cosa se imputa al mes en el que TERMINA: un período se reconoce
+      // cuando cierra. Un avance del 1 al 15 y otro del 16 al 30 caen los dos
+      // en el mismo mes y se suman.
+      const mesDe = (fechaHasta) => {
+        const f = norm(fechaHasta);
+        if (!f) return -1;
+        return periodos.findIndex((p) => f >= p.fecha_desde && f <= p.fecha_hasta);
+      };
+
+      planificaciones.forEach((p) => {
+        const i = mesDe(p.fecha_hasta);
+        if (i >= 0) periodos[i].planifIds.push(p.id);
+      });
+
+      // Pasado el último mes planificado (de cualquier versión) no hay plan: la
+      // línea del planificado se corta ahí, aunque el avance siga.
+      let ultimoMesPlanificado = -1;
+      periodos.forEach((p, i) => { if (p.planifIds.length) ultimoMesPlanificado = i; });
+
       // ✅ PRE-CÁLCULO: porcentaje ponderado POR AVANCE
       // Matching por overlap de rangos (no requiere key exacto)
       const avancePorPeriodoKey = {}; // keyPeriodo -> suma %
@@ -490,9 +511,9 @@ router.get(
         const aHasta = norm(a.periodo_hasta);
 
         if (aDesde && aHasta) {
-          // El avance se imputa a la quincena en la que TERMINA. Si por algún
-          // motivo la fecha de cierre no cae en el eje, se busca por solapamiento.
-          const iCierre = quincenaDe(aHasta);
+          // El avance se imputa al mes en el que TERMINA. Si por algún motivo
+          // la fecha de cierre no cae en el eje, se busca por solapamiento.
+          const iCierre = mesDe(aHasta);
           const matchPeriodo = iCierre >= 0
             ? periodos[iCierre]
             : periodos.find((p) => aDesde < p.fecha_hasta && aHasta > p.fecha_desde);
@@ -580,9 +601,9 @@ router.get(
           const cDesde = norm(cert.periodo_desde);
           const cHasta = norm(cert.periodo_hasta);
           if (!cDesde || !cHasta) return;
-          // Igual que el avance: el certificado cae en la quincena en la que
-          // cierra su período. Si no encaja en el eje, se usa el solapamiento.
-          const iCierre = quincenaDe(cHasta);
+          // Igual que el avance: el certificado cae en el mes en el que cierra
+          // su período. Si no encaja en el eje, se usa el solapamiento.
+          const iCierre = mesDe(cHasta);
           const caeAca = iCierre >= 0
             ? iCierre === idxPeriodo
             : (cDesde < fecha_hasta && cHasta > fecha_desde);
@@ -619,7 +640,8 @@ router.get(
         avancePeriodo = Number(avancePeriodo.toFixed(2));
         acumuladoAvance += avancePeriodo;
 
-        curvaPlan.push(Number(acumuladoPlan.toFixed(2)));
+        // null para que el gráfico corte la línea donde termina el plan.
+        curvaPlan.push(idxPeriodo <= ultimoMesPlanificado ? Number(acumuladoPlan.toFixed(2)) : null);
         curvaCert.push(Number(acumuladoCert.toFixed(2)));
         curvaAvance.push(Number(acumuladoAvance.toFixed(2)));
         certNumerosPorPeriodo.push(numerosCertPeriodo);
@@ -628,89 +650,6 @@ router.get(
         const financieroPorc = (montoFinAcum / totalProyecto) * 100;
         curvaFinanciera.push(Number(financieroPorc.toFixed(2)));
         curvaFinancieraMontos.push(Number(montoFinAcum.toFixed(2)));
-      }
-
-      // ─── PERÍODOS EXTRA (post-planificación) ─────────────────────────────────
-      // Certs y avances que NO solapan con ningún período planificado
-      const certsNoMatched = certificaciones.filter(
-        (c) => !certMatchedIds.has(c.id) && norm(c.periodo_desde) && norm(c.periodo_hasta)
-      );
-
-      const avancesConPeriodoExtra = avancesSinPeriodo.filter(
-        (a) => norm(a.periodo_desde) && norm(a.periodo_hasta)
-      );
-
-      if (certsNoMatched.length > 0 || avancesConPeriodoExtra.length > 0) {
-        // Agrupar por período único
-        const extraPeriodosMap = {};
-
-        certsNoMatched.forEach((c) => {
-          const key = `${norm(c.periodo_desde)}__${norm(c.periodo_hasta)}`;
-          if (!extraPeriodosMap[key]) {
-            extraPeriodosMap[key] = {
-              fecha_desde: norm(c.periodo_desde),
-              fecha_hasta: norm(c.periodo_hasta),
-              certs: [],
-              avancePorc: 0,
-            };
-          }
-          extraPeriodosMap[key].certs.push(c);
-        });
-
-        avancesConPeriodoExtra.forEach((a) => {
-          const key = `${norm(a.periodo_desde)}__${norm(a.periodo_hasta)}`;
-          if (!extraPeriodosMap[key]) {
-            extraPeriodosMap[key] = {
-              fecha_desde: norm(a.periodo_desde),
-              fecha_hasta: norm(a.periodo_hasta),
-              certs: [],
-              avancePorc: 0,
-            };
-          }
-          extraPeriodosMap[key].avancePorc += Number(a.porc || 0);
-        });
-
-        // Ordenar cronológicamente
-        const extraPeriodos = Object.values(extraPeriodosMap).sort(
-          (a, b) => (a.fecha_desde < b.fecha_desde ? -1 : 1)
-        );
-
-        extraPeriodos.forEach((ep) => {
-          labels.push(`${ep.fecha_desde} → ${ep.fecha_hasta}`);
-          labelsHasta.push(ep.fecha_hasta);
-
-          // Planificado: null para que el gráfico corte la línea
-          curvaPlan.push(null);
-
-          // Certificado
-          let certExtraPorc = 0;
-          const numerosExtra = [];
-          ep.certs.forEach((cert) => {
-            const itemsCert = certItemsByCert[cert.id] || [];
-            itemsCert.forEach((i) => {
-              const costo = costoItemMap[i.PliegoItemId] || 0;
-              certExtraPorc +=
-                (Number(i.avance_porcentaje) / 100) *
-                (costo / totalProyecto) *
-                100;
-            });
-            if (cert.numero_certificado) numerosExtra.push(cert.numero_certificado);
-            montoFinAcum += Number(cert.total_neto || 0);
-          });
-          acumuladoCert += certExtraPorc;
-
-          // Avance
-          acumuladoAvance += Number((ep.avancePorc || 0).toFixed(2));
-
-          curvaCert.push(Number(acumuladoCert.toFixed(2)));
-          curvaAvance.push(Number(acumuladoAvance.toFixed(2)));
-          certNumerosPorPeriodo.push(numerosExtra);
-
-          // Financiero
-          const finPorc = (montoFinAcum / totalProyecto) * 100;
-          curvaFinanciera.push(Number(finPorc.toFixed(2)));
-          curvaFinancieraMontos.push(Number(montoFinAcum.toFixed(2)));
-        });
       }
 
       // ── Series de planificación: original y cada versión replanteada ─────
