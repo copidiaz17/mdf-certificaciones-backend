@@ -106,15 +106,17 @@ Detalles que hacen perder tiempo si no se saben:
 - Arrancar el servidor como tarea de fondo aparte; con `&` en la misma línea se colgó una vez.
 - **Nunca contra producción.**
 
-### Suites (`pruebas/`) — 324 casos, verdes en los dos backends
+### Suites (`pruebas/`) — 378 casos, verdes en los dos backends
 
 | Suite | Qué cubre |
 |---|---|
 | `subcontratos.mjs` (83) | Circuito del subcontratista: OC, certificados, adicionales, confirmación |
+| `subcontratos-actualizacion.mjs` (41) | Actualizaciones de precio del contrato del subcontratista |
 | `replanteo.mjs` (64) | Plan por versiones: disponible, curva, edición, borrado, migración de replanteos viejos |
 | `informe-avance.mjs` (51) | Informe de avance y trabajos fuera del pliego |
 | `excedente-a-item.mjs` (43) | Convertir excedente en ítem sin precio + API entre sistemas |
 | `anular-certificacion.mjs` (27) | Anular y que deje de contar |
+| `curva-mensual.mjs` (13) | La curva sigue mensual después del plan; la certificación anulada no suma |
 | `excedentes.mjs` (26) | El avance puede superar el pliego, avisa, queda en cantidad |
 | `avance-ruta-real.mjs` (21) | `POST /obras/:id/avances`, la que usa la app (distinta de `/avanceObra`) |
 | `fotos-informe.mjs` (9) | Fotos del informe |
@@ -130,8 +132,9 @@ obras ──┬── pliegoitems ── (itemgenerals = catálogo)
         ├── certificaciones ── certificacion_items
         ├── informes_avance ── fotos_informe
         └── subcontratos ──┬── subcontrato_items
-                           └── subcontrato_certificados ──┬── subcontrato_certificado_items
-                                                          └── subcontrato_descuentos
+                           ├── subcontrato_certificados ──┬── subcontrato_certificado_items
+                           │                              └── subcontrato_descuentos
+                           └── subcontrato_actualizaciones ── subcontrato_actualizacion_items
 usuarios (roles)
 ```
 
@@ -204,6 +207,19 @@ calcados de la planilla de Excel de Carlos Loza.
 - Lo certificado por encima de lo contratado sale como **renglón propio**: el rubro original nunca
   pasa del 100 %.
 - **El precio se congela** al certificar: cambiar el precio del ítem no revalúa lo ya certificado.
+- **Actualizaciones de precio** (28/09/2026). Los precios del contrato cambian con el tiempo: una
+  actualización dice *desde qué fecha* rigen los precios nuevos de algunos ítems
+  (`subcontrato_actualizaciones` + `_items`, solo los que cambian). El precio de la OC queda como el
+  **original**. Reglas que definió José:
+  - Un certificado va con los precios de la última actualización vigente al **fin de su período**
+    (`hasta`): uno del 25/5 al 7/6 con una actualización desde el 1/6 va entero con el precio nuevo.
+  - Una actualización **solo puede regir después del último certificado**: lo ya certificado no se
+    revalúa ni se ajusta después. Si llegó tarde, la diferencia se arregla aparte.
+  - Una vez que un certificado la usó, no se corrige ni se borra (se carga otra).
+  - Lo pendiente y el "acordado" se valorizan a los últimos precios; `original_oc` guarda lo de la
+    OC a precios originales. La planilla manda la historia de precios de cada ítem (`precios`) para
+    que la pantalla recalcule si se cambia la fecha "hasta".
+  - Cálculo en `utils/subcontratos.js` → `precioEn`, `conPreciosA`, `historiaDePrecios`.
 - Solo se corrige o anula el **último** certificado (cambiar uno del medio alteraría el "anterior"
   de los siguientes, que ya se pagaron). Al corregir/anular, los ítems nuevos que ese certificado
   creó lo acompañan.
@@ -236,7 +252,7 @@ Roles normalizados en `middlewares/authorization.js`: `admin`/`administrador`,
 | `certificaciones.js` | `GET|POST /obras/:obraId/certificaciones`, `/acumulado`, `/:id/detalle`, `PUT /:certId`, `POST /:certId/anular`, `/reactivar` |
 | `avanceObra.js` | `POST /:obraId/items`, `/previsualizar`, `GET /:obraId/excedentes`, `POST /:obraId/excedentes/:id/convertir` |
 | `replanteos.js` | `GET /:obraId/replanteos/contexto`, `POST /:obraId/replanteos`, `PUT|DELETE /:obraId/replanteos/:version` |
-| `subcontratos.js` | `/:obraId/subcontratos*`, `/subcontratos-pliego`, `/:subId/certificados/{nuevo,:certId}`, `POST|PUT` certificados, `/anular` |
+| `subcontratos.js` | `/:obraId/subcontratos*`, `/subcontratos-pliego`, `/:subId/certificados/{nuevo,:certId}`, `POST|PUT` certificados, `/anular`, `POST /:subId/actualizaciones`, `PUT|DELETE /:subId/actualizaciones/:actId` |
 | `informesAvance.js` | `/:obraId/informes-avance*` + fotos |
 | `publica.js` | `/publica/obras`, `/publica/obras/:id/avance`, `/publica/obras/:id/certificados` |
 | `catalogo.js`, `usuarios.js` | catálogo de ítems generales, alta de usuarios |
@@ -255,6 +271,7 @@ Roles normalizados en `middlewares/authorization.js`: `admin`/`administrador`,
 | `AddPlanificacionView` (548) | Plan original (solo versión 0) |
 | `CargarPliegoView` (502) | Pliego, importación |
 | `SubcontratoCertificadoView` (442) | Planilla del certificado del sub |
+| `SubcontratoActualizacionView` | Actualización de precios del contrato del sub: desde qué fecha, qué ítem, cuánto (con "mismo % a todos") |
 | `SubcontratoFormView` / `SubcontratoDetalleView` / `SubcontratosObraView` | OC, estadísticas, lista |
 | `ExcedentesObraView` (279) | Excedentes y su conversión a ítem |
 | `PliegoCompletoView`, `CrearObraView`, `GestionarCatalogoView`, `CrearUsuarioView`, `DashboardView`, `LoginView` | Resto |

@@ -56,6 +56,74 @@ export function sugerirPeriodo({ ultimoHasta, inicio, periodicidad }) {
 
 export const totalItem = (it) => r2(num(it.cantidad) * num(it.precio_unitario));
 
+/* ── Actualizaciones de precio ──────────────────────────────────────────────
+ * El precio de la OC es el ORIGINAL del contrato. Cada actualización dice
+ * desde qué fecha rigen los precios nuevos de algunos ítems, y un certificado
+ * va con los de la última actualización vigente al FIN de su período.
+ */
+
+/**
+ * Ordena las actualizaciones por fecha y les arma el mapa de precios por ítem.
+ * @param actualizaciones  filas de subcontrato_actualizaciones
+ * @param renglones        filas de subcontrato_actualizacion_items
+ */
+export function armarActualizaciones(actualizaciones, renglones) {
+  const precios = {};
+  for (const r of renglones) (precios[r.actualizacion_id] ||= {})[r.subcontrato_item_id] = num(r.precio_unitario);
+  return actualizaciones
+    .map((a) => ({
+      id: a.id, numero: a.numero, fecha_vigencia: norm(a.fecha_vigencia), motivo: a.motivo || null,
+      precios: precios[a.id] || {},
+    }))
+    .sort((a, b) => (a.fecha_vigencia < b.fecha_vigencia ? -1 : a.fecha_vigencia > b.fecha_vigencia ? 1 : a.numero - b.numero));
+}
+
+/** La actualización que rige a una fecha (la última con vigencia hasta ese día). Sin fecha, la última. */
+export function actualizacionEn(actualizaciones, fecha) {
+  let rige = null;
+  for (const a of actualizaciones) {
+    if (fecha && a.fecha_vigencia > norm(fecha)) break;
+    rige = a;
+  }
+  return rige;
+}
+
+/**
+ * El precio de un ítem a una fecha: el de la última actualización vigente ese
+ * día que lo incluye; si ninguna lo tocó, el de la OC. Sin fecha, el último
+ * acordado (aunque todavía no rija).
+ */
+export function precioEn(item, fecha, actualizaciones = []) {
+  let precio = num(item.precio_original ?? item.precio_unitario);
+  for (const a of actualizaciones) {
+    if (fecha && a.fecha_vigencia > norm(fecha)) break;
+    if (a.precios[item.id] !== undefined) precio = a.precios[item.id];
+  }
+  return r2(precio);
+}
+
+/** Los precios que tuvo un ítem: el de la OC y uno por cada actualización que lo tocó. */
+export function historiaDePrecios(item, actualizaciones = []) {
+  const historia = [{ desde: null, numero: 0, precio: r2(item.precio_original ?? item.precio_unitario) }];
+  for (const a of actualizaciones) {
+    if (a.precios[item.id] !== undefined) historia.push({ desde: a.fecha_vigencia, numero: a.numero, precio: r2(a.precios[item.id]) });
+  }
+  return historia;
+}
+
+/**
+ * Los ítems con el precio que rige a una fecha. Conserva el de la OC en
+ * `precio_original`, así los cálculos de siempre (totales, pendiente, avance)
+ * trabajan sin saber que hubo actualizaciones.
+ */
+export function conPreciosA(items, fecha, actualizaciones = []) {
+  return items.map((it) => ({
+    ...it,
+    precio_original: r2(it.precio_original ?? it.precio_unitario),
+    precio_unitario: precioEn(it, fecha, actualizaciones),
+  }));
+}
+
 /** contrato · de_mas · nuevo */
 export const claseDe = (it) =>
   it.origen !== "adicional" ? "contrato" : it.tipo_adicional === "de_mas" ? "de_mas" : "nuevo";
@@ -163,9 +231,12 @@ export function totalesOC(items, cantidadAcum) {
  * para que la pantalla recalcule mientras se escribe, y los totales ya
  * calculados.
  *
- * @param certificados  todos los certificados NO anulados, ordenados por número
+ * @param items           con el precio que rige al fin del período (conPreciosA)
+ * @param certificados    todos los certificados NO anulados, ordenados por número
+ * @param actualizaciones para mandar la historia de precios de cada ítem: si en
+ *                        pantalla se cambia la fecha "hasta", el precio cambia
  */
-export function planillaDe({ items, certificados, certItemsPorCert, descuentos, certificado }) {
+export function planillaDe({ items, certificados, certItemsPorCert, descuentos, certificado, actualizaciones = [] }) {
   const previos = certificados.filter((c) => c.numero < certificado.numero);
   const anterior = sumarCertificados(previos, certItemsPorCert);
   const actual = sumarCertificados(certificado.id ? [certificado] : [], certItemsPorCert);
@@ -185,8 +256,11 @@ export function planillaDe({ items, certificados, certItemsPorCert, descuentos, 
       creado_en_certificado_id: it.creado_en_certificado_id || null,
       contratado: r4(it.cantidad),
       precio_vigente: r2(it.precio_unitario),
+      precio_original: r2(it.precio_original ?? it.precio_unitario),
+      precios: historiaDePrecios(it, actualizaciones),
       // El precio de ESTE certificado: el congelado si ya tiene línea.
       precio: r2(lineaCert ? lineaCert.precio_unitario : it.precio_unitario),
+      congelado: !!lineaCert,
       total: totalItem(it),
       anterior: { cantidad: r4(anterior.cantidad[it.id]), importe: r2(anterior.importe[it.id]) },
       actual: { cantidad: r4(actual.cantidad[it.id]), importe: r2(actual.importe[it.id]) },
@@ -248,6 +322,7 @@ export function resumenSubcontrato({ items, certificados, certItemsPorCert, desc
       rubro_origen: origen ? origen.descripcion : null,
       contratado: r4(contratado),
       precio_unitario: r2(precio),
+      precio_original: r2(it.precio_original ?? precio),
       total: totalItem(it),
       certificado: r4(Math.min(acum, contratado)),
       certificado_importe: r2(acum ? (num(importe[it.id]) * Math.min(acum, contratado)) / acum : 0),
@@ -299,9 +374,16 @@ export function resumenSubcontrato({ items, certificados, certItemsPorCert, desc
   const certificadoImporte = r2(Object.values(importe).reduce((s, v) => s + v, 0));
   const totalDescuentos = r2(descuentos.reduce((s, d) => s + num(d.importe), 0));
 
+  // Lo que decía la OC a los precios originales: con actualizaciones, `original`
+  // ya viene a los precios nuevos y sin esto no se ve cuánto subió.
+  const originalOC = r2(items
+    .filter((it) => claseDe(it) === "contrato")
+    .reduce((s, it) => s + num(it.cantidad) * num(it.precio_original ?? it.precio_unitario), 0));
+
   return {
     totales: {
       ...tot,
+      original_oc: originalOC,
       certificado: certificadoImporte,
       descuentos: totalDescuentos,
       neto_pagado: r2(certificadoImporte - totalDescuentos),

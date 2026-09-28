@@ -13,6 +13,9 @@
 //   POST   /obras/:obraId/subcontratos/:subId/certificados             certifica un período
 //   PUT    /obras/:obraId/subcontratos/:subId/certificados/:certId     corrige el ÚLTIMO
 //   POST   /obras/:obraId/subcontratos/:subId/certificados/:certId/anular  anula el ÚLTIMO
+//   POST   /obras/:obraId/subcontratos/:subId/actualizaciones          actualización de precios
+//   PUT    /obras/:obraId/subcontratos/:subId/actualizaciones/:actId   la corrige (si no se usó)
+//   DELETE /obras/:obraId/subcontratos/:subId/actualizaciones/:actId   la borra (si no se usó)
 //
 // El subcontratista NO tiene plan de trabajo: el avance se registra
 // directamente contra la orden de compra, como en la planilla de Excel.
@@ -31,11 +34,15 @@ import SubcontratoItem from "../models/SubcontratoItem.js";
 import {
   SubcontratoCertificado, SubcontratoCertificadoItem, SubcontratoDescuento,
 } from "../models/SubcontratoCertificado.js";
+import {
+  SubcontratoActualizacion, SubcontratoActualizacionItem,
+} from "../models/SubcontratoActualizacion.js";
 
 import { authMiddleware } from "./auth.js";
 import { hasRole, ROLES } from "../middlewares/authorization.js";
 import {
-  planillaDe, resumenSubcontrato, sugerirPeriodo, esFecha, norm, r2, r4,
+  planillaDe, resumenSubcontrato, sugerirPeriodo, esFecha, norm, r2, r4, sumarDias,
+  armarActualizaciones, actualizacionEn, precioEn, historiaDePrecios, conPreciosA,
 } from "../utils/subcontratos.js";
 
 const router = express.Router();
@@ -48,6 +55,12 @@ const PERIODICIDADES = ["quincenal", "semanal"];
 const TIPOS_ADICIONAL = ["de_mas", "nuevo"];
 const TIPOS_DESCUENTO = ["adelanto", "herramientas", "otro"];
 const TOLERANCIA = 0.0001;
+
+// Las fechas de los mensajes las lee una persona, no un programador.
+const fechaTexto = (f) => {
+  const [a, m, d] = norm(f).split("-");
+  return a && m && d ? `${d}/${m}/${a}` : norm(f);
+};
 
 const hoyISO = () => {
   const h = new Date();
@@ -84,20 +97,35 @@ async function cargar(obraId, subId, t) {
   const descuentos = certIds.length
     ? await SubcontratoDescuento.findAll({ where: { certificado_id: certIds }, raw: true, transaction: t })
     : [];
+  const actualizaciones = await SubcontratoActualizacion.findAll({ where: { subcontrato_id: sub.id }, raw: true, transaction: t });
+  const renglones = actualizaciones.length
+    ? await SubcontratoActualizacionItem.findAll({ where: { actualizacion_id: actualizaciones.map((a) => a.id) }, raw: true, transaction: t })
+    : [];
 
+  const vigentes = todos.filter((c) => !c.anulado);
   return {
     sub,
     items,
     todos,
-    vigentes: todos.filter((c) => !c.anulado),
+    vigentes,
     certItemsPorCert: agrupar(certItems, "certificado_id"),
     descuentosPorCert: agrupar(descuentos, "certificado_id"),
+    actualizaciones: armarActualizaciones(actualizaciones, renglones),
+    // Hasta dónde llega lo certificado: una actualización tiene que regir después.
+    ultimoHasta: vigentes.length ? norm(vigentes[vigentes.length - 1].hasta) : null,
   };
 }
 
+/** Los ítems con los precios que rigen a una fecha (sin fecha, los últimos acordados). */
+const itemsA = (d, fecha) => conPreciosA(d.items, fecha, d.actualizaciones);
+
+/** El certificado vigente más viejo que ya usa los precios de una actualización. */
+const certificadoQueUsa = (d, act) => d.vigentes.find((c) => norm(c.hasta) >= act.fecha_vigencia) || null;
+
 function resumenDe(d) {
   return resumenSubcontrato({
-    items: d.items,
+    // Lo que falta se valoriza a los últimos precios acordados.
+    items: itemsA(d, null),
     certificados: d.vigentes,
     certItemsPorCert: d.certItemsPorCert,
     descuentos: d.vigentes.flatMap((c) => d.descuentosPorCert[c.id] || []),
@@ -115,6 +143,28 @@ function datosCabecera(s) {
 const itemsPlanos = (items) => items.map((it) => ({
   ...it, cantidad: Number(it.cantidad), precio_unitario: Number(it.precio_unitario),
 }));
+
+/** Las actualizaciones como las muestra la pantalla: qué ítem pasa de qué precio a cuál. */
+function actualizacionesDe(d) {
+  return d.actualizaciones.map((a) => {
+    const usa = certificadoQueUsa(d, a);
+    const antes = d.actualizaciones.filter((x) => x.id !== a.id);
+    const diaAnterior = sumarDias(a.fecha_vigencia, -1);
+    return {
+      id: a.id, numero: a.numero, fecha_vigencia: a.fecha_vigencia, motivo: a.motivo,
+      // Una vez que un certificado usó estos precios, ya no se tocan.
+      editable: !usa,
+      usada_por_certificado: usa ? usa.numero : null,
+      items: d.items
+        .filter((it) => a.precios[it.id] !== undefined)
+        .map((it) => ({
+          subcontrato_item_id: it.id, numero: it.numero, descripcion: it.descripcion, unidad: it.unidad,
+          precio_anterior: precioEn(it, diaAnterior, antes),
+          precio: r2(a.precios[it.id]),
+        })),
+    };
+  });
+}
 
 /**
  * Valida la cabecera y los ítems de una OC. Devuelve { error } o los datos listos.
@@ -284,7 +334,7 @@ router.get("/:obraId/subcontratos/:subId", authMiddleware, LEER, async (req, res
     const certificados = d.todos.map((c) => {
       if (c.anulado) return { ...c, importe: null, descuentos: null, a_pagar: null, avance_acumulado: null };
       const p = planillaDe({
-        items: d.items, certificados: d.vigentes, certItemsPorCert: d.certItemsPorCert,
+        items: itemsA(d, c.hasta), certificados: d.vigentes, certItemsPorCert: d.certItemsPorCert,
         descuentos: d.descuentosPorCert[c.id] || [], certificado: c,
       });
       return {
@@ -298,9 +348,16 @@ router.get("/:obraId/subcontratos/:subId", authMiddleware, LEER, async (req, res
 
     return res.json({
       subcontrato: datosCabecera(d.sub),
-      items: itemsPlanos(d.items),
+      items: itemsPlanos(d.items).map((it) => ({
+        ...it,
+        precio_vigente: precioEn(it, null, d.actualizaciones),
+        precios: historiaDePrecios(it, d.actualizaciones),
+      })),
       resumen: resumenDe(d),
       certificados,
+      actualizaciones: actualizacionesDe(d),
+      // Desde cuándo puede regir una actualización nueva: después del último certificado.
+      actualizacion_desde_minima: d.ultimoHasta ? sumarDias(d.ultimoHasta, 1) : null,
       ultimo_certificado_id: d.vigentes[d.vigentes.length - 1]?.id || null,
     });
   } catch (error) {
@@ -348,7 +405,10 @@ router.put("/:obraId/subcontratos/:subId", authMiddleware, ESCRIBIR, async (req,
     }
 
     await d.sub.update(datos.cabecera, { transaction: t });
-    if (aBorrar.length) await SubcontratoItem.destroy({ where: { id: aBorrar.map((i) => i.id) }, transaction: t });
+    if (aBorrar.length) {
+      await SubcontratoActualizacionItem.destroy({ where: { subcontrato_item_id: aBorrar.map((i) => i.id) }, transaction: t });
+      await SubcontratoItem.destroy({ where: { id: aBorrar.map((i) => i.id) }, transaction: t });
+    }
     for (const it of datos.items) {
       const { id, ...campos } = it;
       if (id) await SubcontratoItem.update(campos, { where: { id }, transaction: t });
@@ -383,6 +443,11 @@ router.delete("/:obraId/subcontratos/:subId", authMiddleware, ESCRIBIR, async (r
       await SubcontratoCertificadoItem.destroy({ where: { certificado_id: certIds }, transaction: t });
       await SubcontratoCertificado.destroy({ where: { id: certIds }, transaction: t });
     }
+    if (d.actualizaciones.length) {
+      const actIds = d.actualizaciones.map((a) => a.id);
+      await SubcontratoActualizacionItem.destroy({ where: { actualizacion_id: actIds }, transaction: t });
+      await SubcontratoActualizacion.destroy({ where: { id: actIds }, transaction: t });
+    }
     await SubcontratoItem.destroy({ where: { subcontrato_id: d.sub.id }, transaction: t });
     await d.sub.destroy({ transaction: t });
     await t.commit();
@@ -400,10 +465,12 @@ router.delete("/:obraId/subcontratos/:subId", authMiddleware, ESCRIBIR, async (r
 
 /** La planilla de un certificado, con cabecera y descuentos. */
 function armarPlanilla(d, cert) {
+  // Los precios que rigen al FIN del período.
   const p = planillaDe({
-    items: d.items, certificados: d.vigentes, certItemsPorCert: d.certItemsPorCert,
-    descuentos: d.descuentosPorCert[cert.id] || [], certificado: cert,
+    items: itemsA(d, cert.hasta), certificados: d.vigentes, certItemsPorCert: d.certItemsPorCert,
+    descuentos: d.descuentosPorCert[cert.id] || [], certificado: cert, actualizaciones: d.actualizaciones,
   });
+  const rige = actualizacionEn(d.actualizaciones, cert.hasta);
   const ultimo = d.vigentes[d.vigentes.length - 1];
   return {
     subcontrato: datosCabecera(d.sub),
@@ -413,6 +480,9 @@ function armarPlanilla(d, cert) {
     },
     filas: p.filas,
     totales: p.totales,
+    // Con qué precios va: los de la OC o los de una actualización.
+    actualizacion: rige ? { numero: rige.numero, fecha_vigencia: rige.fecha_vigencia, motivo: rige.motivo } : null,
+    actualizaciones: d.actualizaciones.map((a) => ({ numero: a.numero, fecha_vigencia: a.fecha_vigencia, motivo: a.motivo })),
     descuentos: (d.descuentosPorCert[cert.id] || []).map((x) => ({ tipo: x.tipo, concepto: x.concepto, importe: Number(x.importe) })),
     // Solo se corrige el último; uno nuevo, siempre.
     editable: !cert.id || (!cert.anulado && cert.id === ultimo?.id),
@@ -626,8 +696,9 @@ router.post("/:obraId/subcontratos/:subId/certificados", authMiddleware, ESCRIBI
     await guardarLineas({
       cert, t, descuentos: datos.descuentos,
       lineas: [
-        // Precio congelado: el vigente del ítem al certificar.
-        ...datos.items.map((l) => ({ ...l, precio_unitario: Number(itemsPorId.get(l.id).precio_unitario) })),
+        // Precio congelado: el que rige al fin del período (la OC o la última
+        // actualización vigente ese día).
+        ...datos.items.map((l) => ({ ...l, precio_unitario: precioEn(itemsPorId.get(l.id), datos.hasta, d.actualizaciones) })),
         ...nuevos,
       ],
     });
@@ -691,12 +762,18 @@ router.put("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, 
     if (aBorrar.length) await SubcontratoItem.destroy({ where: { id: aBorrar }, transaction: t });
 
     const nuevos = await crearNuevos({ d, datos, cert, t });
+    // Al corregir se conserva el precio congelado, salvo que el nuevo fin del
+    // período caiga bajo otros precios (se corrió la fecha "hasta" más allá de
+    // una actualización, o para antes): ahí manda el que rige ese día.
+    const precioAl = (it, fecha) => precioEn(it, fecha, d.actualizaciones);
     await guardarLineas({
       cert, t, descuentos: datos.descuentos,
       lineas: [
-        ...datos.items.filter((l) => !aBorrar.includes(l.id)).map((l) => ({
-          ...l, precio_unitario: preciosPrevios[l.id] ?? Number(itemsPorId.get(l.id).precio_unitario),
-        })),
+        ...datos.items.filter((l) => !aBorrar.includes(l.id)).map((l) => {
+          const it = itemsPorId.get(l.id);
+          const cambia = precioAl(it, datos.hasta) !== precioAl(it, norm(cert.hasta));
+          return { ...l, precio_unitario: cambia ? precioAl(it, datos.hasta) : (preciosPrevios[l.id] ?? precioAl(it, datos.hasta)) };
+        }),
         ...nuevos,
       ],
     });
@@ -737,6 +814,144 @@ router.post("/:obraId/subcontratos/:subId/certificados/:certId/anular", authMidd
     await t.rollback();
     console.error("Error anulando certificado de subcontrato:", error);
     return res.status(500).json({ message: "Error al anular el certificado" });
+  }
+});
+
+/* ======================================================
+   ACTUALIZACIONES DE PRECIO
+   · Rige desde una fecha: los certificados cuyo período termina ese día o
+     después van con los precios nuevos.
+   · Solo puede regir después del último certificado. Lo ya certificado no se
+     revalúa ni se ajusta después (lo definió José).
+   · Una vez que un certificado la usó, no se corrige ni se borra.
+====================================================== */
+
+/**
+ * Valida una actualización. `actual` es la que se corrige (null si es nueva).
+ * Guarda solo los ítems cuyo precio cambia respecto del que regía el día antes.
+ */
+function validarActualizacion({ body, d, actual }) {
+  const fecha = norm(body.fecha_vigencia);
+  if (!esFecha(fecha)) return { error: "Indicá desde qué fecha rigen los precios nuevos." };
+  if (d.ultimoHasta && fecha <= d.ultimoHasta) {
+    return {
+      error: `Los precios nuevos tienen que regir después del último certificado, que llega hasta el ${fechaTexto(d.ultimoHasta)}. `
+        + "Lo ya certificado no se cambia: si la actualización llegó tarde, la diferencia se arregla aparte.",
+    };
+  }
+  const otras = d.actualizaciones.filter((a) => !actual || a.id !== actual.id);
+  if (otras.some((a) => a.fecha_vigencia === fecha)) {
+    return { error: `Ya hay una actualización que rige desde el ${fechaTexto(fecha)}: corregí esa en vez de cargar otra.` };
+  }
+
+  const itemsPorId = new Map(d.items.map((i) => [i.id, i]));
+  const diaAnterior = sumarDias(fecha, -1);
+  const vistos = new Set();
+  const precios = [];
+  for (const r of Array.isArray(body.items) ? body.items : []) {
+    const id = Number(r.subcontrato_item_id);
+    const precio = Number(r.precio_unitario);
+    const it = itemsPorId.get(id);
+    if (!it) return { error: "Hay ítems que no son de este subcontrato." };
+    if (vistos.has(id)) return { error: `El ítem "${it.descripcion}" aparece dos veces.` };
+    vistos.add(id);
+    if (!Number.isFinite(precio) || precio < 0) return { error: `El precio nuevo de "${it.descripcion}" no es válido.` };
+    // Un ítem que queda igual no se guarda: si no, una actualización posterior
+    // de otro ítem lo "tocaría" sin motivo.
+    if (r2(precio) === precioEn(it, diaAnterior, otras)) continue;
+    precios.push({ subcontrato_item_id: id, precio_unitario: r2(precio) });
+  }
+  if (!precios.length) return { error: "Ningún precio cambia: no hay nada que actualizar." };
+
+  return { fecha, motivo: String(body.motivo || "").trim().slice(0, 300) || null, precios };
+}
+
+router.post("/:obraId/subcontratos/:subId/actualizaciones", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const { obraId, subId } = req.params;
+    const d = await cargar(obraId, subId, t);
+    if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
+    if (d.sub.estado === "anulado") { await t.rollback(); return res.status(400).json({ message: "El subcontrato está anulado." }); }
+
+    const datos = validarActualizacion({ body: req.body, d, actual: null });
+    if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
+
+    const numero = d.actualizaciones.reduce((m, a) => Math.max(m, a.numero), 0) + 1;
+    const act = await SubcontratoActualizacion.create({
+      subcontrato_id: d.sub.id, numero, fecha_vigencia: datos.fecha, motivo: datos.motivo,
+      creado_por_id: req.user?.id || null,
+    }, { transaction: t });
+    await SubcontratoActualizacionItem.bulkCreate(
+      datos.precios.map((p) => ({ ...p, actualizacion_id: act.id })), { transaction: t }
+    );
+    await t.commit();
+    return res.status(201).json({
+      ok: true, id: act.id, numero,
+      message: `Actualización N° ${numero}: ${datos.precios.length} precio(s) nuevo(s) desde el ${fechaTexto(datos.fecha)}`,
+    });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error creando actualización de precios:", error);
+    return res.status(500).json({ message: "Error al guardar la actualización" });
+  }
+});
+
+/** Carga la actualización y frena si un certificado ya usó sus precios. */
+async function actualizacionEditable(req, res, t) {
+  const { obraId, subId, actId } = req.params;
+  const d = await cargar(obraId, subId, t);
+  if (!d) { res.status(404).json({ message: "Subcontrato no encontrado" }); return null; }
+  const act = d.actualizaciones.find((a) => a.id === Number(actId));
+  if (!act) { res.status(404).json({ message: "Actualización no encontrada" }); return null; }
+  const usa = certificadoQueUsa(d, act);
+  if (usa) {
+    res.status(400).json({
+      message: `El certificado N° ${usa.numero} ya se hizo con estos precios: la actualización no se puede cambiar. `
+        + "Si hay que corregir un precio, cargá otra actualización.",
+    });
+    return null;
+  }
+  return { d, act };
+}
+
+router.put("/:obraId/subcontratos/:subId/actualizaciones/:actId", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const r = await actualizacionEditable(req, res, t);
+    if (!r) { await t.rollback(); return; }
+    const datos = validarActualizacion({ body: req.body, d: r.d, actual: r.act });
+    if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
+
+    await SubcontratoActualizacion.update(
+      { fecha_vigencia: datos.fecha, motivo: datos.motivo }, { where: { id: r.act.id }, transaction: t }
+    );
+    await SubcontratoActualizacionItem.destroy({ where: { actualizacion_id: r.act.id }, transaction: t });
+    await SubcontratoActualizacionItem.bulkCreate(
+      datos.precios.map((p) => ({ ...p, actualizacion_id: r.act.id })), { transaction: t }
+    );
+    await t.commit();
+    return res.json({ ok: true, message: `Actualización N° ${r.act.numero} corregida` });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error corrigiendo actualización de precios:", error);
+    return res.status(500).json({ message: "Error al corregir la actualización" });
+  }
+});
+
+router.delete("/:obraId/subcontratos/:subId/actualizaciones/:actId", authMiddleware, ESCRIBIR, async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const r = await actualizacionEditable(req, res, t);
+    if (!r) { await t.rollback(); return; }
+    await SubcontratoActualizacionItem.destroy({ where: { actualizacion_id: r.act.id }, transaction: t });
+    await SubcontratoActualizacion.destroy({ where: { id: r.act.id }, transaction: t });
+    await t.commit();
+    return res.json({ ok: true, message: `Actualización N° ${r.act.numero} borrada` });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error borrando actualización de precios:", error);
+    return res.status(500).json({ message: "Error al borrar la actualización" });
   }
 });
 

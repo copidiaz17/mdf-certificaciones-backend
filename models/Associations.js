@@ -14,6 +14,7 @@ import AvanceObraItem from "./AvanceObraItem.js";
 import Subcontrato from "./Subcontrato.js";
 import SubcontratoItem from "./SubcontratoItem.js";
 import { SubcontratoCertificado, SubcontratoCertificadoItem, SubcontratoDescuento } from "./SubcontratoCertificado.js";
+import { SubcontratoActualizacion, SubcontratoActualizacionItem } from "./SubcontratoActualizacion.js";
 import InformeAvance from "./InformeAvance.js";
 import FotoInforme from "./FotoInforme.js";
 
@@ -183,6 +184,15 @@ SubcontratoCertificadoItem.belongsTo(SubcontratoCertificado, { foreignKey: "cert
 SubcontratoCertificadoItem.belongsTo(SubcontratoItem, { foreignKey: "subcontrato_item_id", as: "item" });
 SubcontratoCertificado.hasMany(SubcontratoDescuento, { foreignKey: "certificado_id", as: "descuentos" });
 SubcontratoDescuento.belongsTo(SubcontratoCertificado, { foreignKey: "certificado_id", as: "certificado" });
+
+// Actualizaciones de precio del contrato. Los renglones se borran a mano antes
+// que su actualización o que el ítem de la OC (routes/subcontratos.js), así que
+// no hace falta que la base los arrastre.
+Subcontrato.hasMany(SubcontratoActualizacion, { foreignKey: "subcontrato_id", as: "actualizaciones" });
+SubcontratoActualizacion.belongsTo(Subcontrato, { foreignKey: "subcontrato_id", as: "subcontrato" });
+SubcontratoActualizacion.hasMany(SubcontratoActualizacionItem, { foreignKey: "actualizacion_id", as: "items" });
+SubcontratoActualizacionItem.belongsTo(SubcontratoActualizacion, { foreignKey: "actualizacion_id", as: "actualizacion" });
+SubcontratoActualizacionItem.belongsTo(SubcontratoItem, { foreignKey: "subcontrato_item_id", as: "item", constraints: false });
 
 /* ======================================================
    🔹 INFORMES DE AVANCE

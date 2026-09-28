@@ -34,6 +34,7 @@ NODE_ENV=development DB_HOST=localhost DB_PORT=3306 \
 |---|---|
 | `replanteo.mjs` | El replanteo como versión del plan: disponible, curva, edición, borrado, ítems adicionales y la migración de los replanteos viejos |
 | `subcontratos.mjs` | El circuito del subcontratista (caso real de Loza): OC con ítems del pliego y propios (sin plan de trabajo), certificados con anterior calculado y precio congelado, confirmación de lo cargado de más y de los ítems nuevos, adicionales "de más" y "nuevo", y descuentos |
+| `subcontratos-actualizacion.mjs` | Actualizaciones de precio del contrato: rigen desde una fecha, el certificado va con los precios vigentes al fin de su período, no pueden regir antes del último certificado y, una vez usadas, no se tocan |
 | `excedentes.mjs` | El avance puede superar el pliego, avisa, y el excedente queda en cantidad |
 | `excedente-a-item.mjs` | Convertir el excedente en un ítem nuevo sin precio, y la API entre sistemas |
 | `avance-ruta-real.mjs` | La ruta que USA la aplicación (`POST /obras/:id/avances`), que es distinta de `/avanceObra` |
