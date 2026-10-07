@@ -203,6 +203,8 @@ export async function migrar({ silencioso = false } = {}) {
   await agregarColumna("subcontrato_items", "tipo_adicional", "ENUM('de_mas','nuevo') NULL DEFAULT NULL", log);
   await agregarColumna("subcontrato_items", "item_origen_id", "INT NULL DEFAULT NULL", log);
   await agregarColumna("subcontrato_items", "creado_en_certificado_id", "INT NULL DEFAULT NULL", log);
+  // Quién corrigió un certificado: se puede corregir cualquiera, no solo el último.
+  await agregarColumna("subcontrato_certificados", "editado_por_id", "INT NULL DEFAULT NULL", log);
 
   log("✅ Esquema al día");
 }

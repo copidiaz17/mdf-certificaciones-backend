@@ -269,13 +269,38 @@ try {
   check("ni el rubro que agranda un adicional", r.status === 400, `→ ${r.status}`);
 
   // ─────────────────────────────────────────────────────────────────
-  console.log("\n=== Solo se corrige o anula el ÚLTIMO certificado ===");
-  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`, {
-    desde: "2026-02-23", hasta: "2026-03-06", items: [{ subcontrato_item_id: s.S3, cantidad: 1 }],
+  console.log("\n=== Se corrige cualquier certificado; se anula solo el ÚLTIMO ===");
+  // Un jefe de obra cargó mal varios certificados de Loza y solo se podía
+  // corregir el último. El "anterior" se calcula, no se copia: corregir uno del
+  // medio mueve el anterior de los siguientes, pero no lo certificado en ellos.
+  const cuerpoC2 = (s3, extra = {}) => ({
+    desde: "2026-02-23", hasta: "2026-03-06",
+    items: [{ subcontrato_item_id: s.S3, cantidad: s3 }, { subcontrato_item_id: s.S2, cantidad: 25.81 }, { subcontrato_item_id: s.S4, cantidad: 3 }],
+    descuentos: [
+      { tipo: "adelanto", concepto: "Adelanto del 27/02", importe: 200000 },
+      { tipo: "herramientas", concepto: "Amoladora y discos", importe: 45000 },
+    ],
+    ...extra,
   });
-  check("corregir uno del medio se rechaza", r.status === 400, `→ ${r.status}`);
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`, cuerpoC2(190, { hasta: "2026-03-10" }));
+  check("uno del medio no puede pisarse con el siguiente", r.status === 400 && /N° 3/.test(r.data?.message || "") && /09\/03\/2026/.test(r.data?.message || ""),
+    `→ ${r.status} ${r.data?.message}`);
+  const pl3Antes = (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`)).data;
+  check("la planilla del N° 2 se puede corregir", (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`)).data.editable === true);
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`, cuerpoC2(200));
+  check("se corrige el N° 2 aunque no sea el último", r.status === 200, `→ ${r.status} ${r.data?.message}`);
+  pl = (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`)).data;
+  check("vale 10 m2 más de tabique al precio congelado: $4.343.150", cerca(pl.totales.importe.actual, 4343150), `→ ${pl.totales.importe.actual}`);
+  check("y queda registrado que se corrigió", !!pl.corregido, `→ ${JSON.stringify(pl.corregido)}`);
+  check("no es el último: no ofrece anularlo", pl.es_ultimo === false);
+  const pl3 = (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`)).data;
+  check("el ANTERIOR del tabique en el N° 3 se acomoda solo: 240 + 200", cerca(pl3.filas.find((f) => f.id === s.S3).anterior.cantidad, 440),
+    `→ ${pl3.filas.find((f) => f.id === s.S3).anterior.cantidad}`);
+  check("pero lo certificado en el N° 3 no cambia", cerca(pl3.totales.importe.actual, pl3Antes.totales.importe.actual), `→ ${pl3.totales.importe.actual}`);
+  r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`, cuerpoC2(190));
+  check("y se vuelve a como estaba", r.status === 200, `→ ${r.status} ${r.data?.message}`);
   r = await req("POST", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}/anular`);
-  check("anular uno del medio se rechaza", r.status === 400, `→ ${r.status}`);
+  check("anular uno del medio se sigue rechazando", r.status === 400, `→ ${r.status}`);
 
   const corr = (items, extra = {}) => ({ desde: "2026-03-09", hasta: "2026-03-20", items, ...extra });
   r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`,

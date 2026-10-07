@@ -11,7 +11,7 @@
 //   GET    /obras/:obraId/subcontratos/:subId/certificados/nuevo       planilla en blanco
 //   GET    /obras/:obraId/subcontratos/:subId/certificados/:certId     planilla de un certificado
 //   POST   /obras/:obraId/subcontratos/:subId/certificados             certifica un período
-//   PUT    /obras/:obraId/subcontratos/:subId/certificados/:certId     corrige el ÚLTIMO
+//   PUT    /obras/:obraId/subcontratos/:subId/certificados/:certId     corrige cualquiera
 //   POST   /obras/:obraId/subcontratos/:subId/certificados/:certId/anular  anula el ÚLTIMO
 //   POST   /obras/:obraId/subcontratos/:subId/actualizaciones          actualización de precios
 //   PUT    /obras/:obraId/subcontratos/:subId/actualizaciones/:actId   la corrige (si no se usó)
@@ -30,6 +30,7 @@ import { sequelize } from "../database.js";
 import Obra from "../models/Obra.js";
 import PliegoItem from "../models/PliegoItem.js";
 import Subcontrato from "../models/Subcontrato.js";
+import Usuario from "../models/Usuario.js";
 import SubcontratoItem from "../models/SubcontratoItem.js";
 import {
   SubcontratoCertificado, SubcontratoCertificadoItem, SubcontratoDescuento,
@@ -484,8 +485,26 @@ function armarPlanilla(d, cert) {
     actualizacion: rige ? { numero: rige.numero, fecha_vigencia: rige.fecha_vigencia, motivo: rige.motivo } : null,
     actualizaciones: d.actualizaciones.map((a) => ({ numero: a.numero, fecha_vigencia: a.fecha_vigencia, motivo: a.motivo })),
     descuentos: (d.descuentosPorCert[cert.id] || []).map((x) => ({ tipo: x.tipo, concepto: x.concepto, importe: Number(x.importe) })),
-    // Solo se corrige el último; uno nuevo, siempre.
-    editable: !cert.id || (!cert.anulado && cert.id === ultimo?.id),
+    // Se corrige cualquiera que no esté anulado: el "anterior" de los
+    // siguientes se calcula, no se copia, así que se acomoda solo. Anular, en
+    // cambio, solo el último.
+    editable: !cert.id || !cert.anulado,
+    es_ultimo: !cert.id || cert.id === ultimo?.id,
+  };
+}
+
+/** Quién lo cargó y quién lo corrigió, con nombre. */
+async function autoresDe(cert) {
+  const ids = [cert.creado_por_id, cert.editado_por_id].filter(Boolean);
+  const nombres = new Map(
+    (ids.length ? await Usuario.findAll({ where: { id: ids }, attributes: ["id", "nombre"], raw: true }) : [])
+      .map((u) => [u.id, u.nombre])
+  );
+  return {
+    cargado_por: nombres.get(cert.creado_por_id) || null,
+    corregido: cert.editado_por_id
+      ? { por: nombres.get(cert.editado_por_id) || null, el: cert.updatedAt || null }
+      : null,
   };
 }
 
@@ -515,7 +534,7 @@ router.get("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, 
     if (!d) return res.status(404).json({ message: "Subcontrato no encontrado" });
     const cert = d.todos.find((c) => c.id === Number(certId));
     if (!cert) return res.status(404).json({ message: "Certificado no encontrado" });
-    return res.json(armarPlanilla(d, cert));
+    return res.json({ ...armarPlanilla(d, cert), ...(await autoresDe(cert)) });
   } catch (error) {
     console.error("Error planilla certificado:", error);
     return res.status(500).json({ message: "Error al cargar el certificado" });
@@ -523,18 +542,22 @@ router.get("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, 
 });
 
 /**
- * Valida un certificado. `anteriorHasta` es el cierre del certificado previo:
- * los períodos no se pueden pisar.
+ * Valida un certificado. `anteriorHasta` es el cierre del certificado previo y
+ * `siguiente` el que viene después (al corregir uno del medio): los períodos
+ * no se pueden pisar.
  *
  * `nuevos` son rubros que no estaban en la OC y se cargan directo en el
  * certificado: se registran como adicional "ítem nuevo".
  */
-function validarCertificado({ body, d, anteriorHasta }) {
+function validarCertificado({ body, d, anteriorHasta, siguiente = null }) {
   const desde = norm(body.desde);
   const hasta = norm(body.hasta);
   if (!esFecha(desde) || !esFecha(hasta) || desde > hasta) return { error: "Indicá el período: desde y hasta." };
   if (anteriorHasta && desde <= anteriorHasta) {
-    return { error: `El período se pisa con el certificado anterior, que llega hasta el ${anteriorHasta}.` };
+    return { error: `El período se pisa con el certificado anterior, que llega hasta el ${fechaTexto(anteriorHasta)}.` };
+  }
+  if (siguiente && hasta >= norm(siguiente.desde)) {
+    return { error: `El período se pisa con el certificado siguiente (N° ${siguiente.numero}), que empieza el ${fechaTexto(siguiente.desde)}.` };
   }
   if (body.fecha && !esFecha(norm(body.fecha))) return { error: "La fecha del certificado no es válida." };
 
@@ -723,15 +746,15 @@ router.put("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, 
     if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
     const cert = d.vigentes.find((c) => c.id === Number(certId));
     if (!cert) { await t.rollback(); return res.status(404).json({ message: "Certificado no encontrado" }); }
-    // Solo el último: corregir uno del medio cambiaría el "anterior" de los
-    // siguientes, que ya se pagaron.
-    if (cert.id !== d.vigentes[d.vigentes.length - 1].id) {
-      await t.rollback();
-      return res.status(400).json({ message: "Solo se puede corregir el último certificado." });
-    }
-
-    const previo = d.vigentes[d.vigentes.length - 2];
-    const datos = validarCertificado({ body: req.body, d, anteriorHasta: previo ? norm(previo.hasta) : null });
+    // Se corrige cualquiera. Antes solo el último, para no cambiar el
+    // "anterior" de los siguientes; pero el anterior se calcula siempre de los
+    // certificados previos, así que corregir uno del medio solo mueve el
+    // anterior y el acumulado de los que siguen: lo certificado en cada uno
+    // (su cantidad por su precio congelado) no cambia.
+    const pos = d.vigentes.findIndex((c) => c.id === cert.id);
+    const previo = d.vigentes[pos - 1];
+    const siguiente = d.vigentes[pos + 1] || null;
+    const datos = validarCertificado({ body: req.body, d, anteriorHasta: previo ? norm(previo.hasta) : null, siguiente });
     if (datos.error) { await t.rollback(); return res.status(400).json({ message: datos.error }); }
 
     const extras = extrasDe(d, datos, cert);
@@ -740,8 +763,25 @@ router.put("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, 
     const preciosPrevios = Object.fromEntries(
       (d.certItemsPorCert[cert.id] || []).map((ci) => [ci.subcontrato_item_id, Number(ci.precio_unitario)])
     );
+    // Un ítem nuevo que nació en este certificado y se lleva a cero se borra
+    // de la OC; si un certificado posterior lo sigue certificando, no se puede.
+    const cantidadNueva = new Map(datos.items.map((l) => [l.id, l.cantidad]));
+    for (const it of d.items.filter((i) => i.creado_en_certificado_id === cert.id)) {
+      if (cantidadNueva.get(it.id)) continue;
+      const otro = d.vigentes.find((c) => c.id !== cert.id && (d.certItemsPorCert[c.id] || []).some((ci) => ci.subcontrato_item_id === it.id));
+      if (otro) {
+        await t.rollback();
+        return res.status(400).json({
+          message: `"${it.descripcion}" nació en este certificado y el N° ${otro.numero} también lo certifica: no se puede llevar a cero acá.`,
+        });
+      }
+    }
+
     await SubcontratoCertificado.update(
-      { desde: datos.desde, hasta: datos.hasta, fecha: datos.fecha || cert.fecha, observaciones: datos.observaciones },
+      {
+        desde: datos.desde, hasta: datos.hasta, fecha: datos.fecha || cert.fecha, observaciones: datos.observaciones,
+        editado_por_id: req.user?.id || null,
+      },
       { where: { id: cert.id }, transaction: t }
     );
     await SubcontratoCertificadoItem.destroy({ where: { certificado_id: cert.id }, transaction: t });

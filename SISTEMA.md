@@ -106,11 +106,11 @@ Detalles que hacen perder tiempo si no se saben:
 - Arrancar el servidor como tarea de fondo aparte; con `&` en la misma línea se colgó una vez.
 - **Nunca contra producción.**
 
-### Suites (`pruebas/`) — 378 casos, verdes en los dos backends
+### Suites (`pruebas/`) — 386 casos, verdes en los dos backends
 
 | Suite | Qué cubre |
 |---|---|
-| `subcontratos.mjs` (83) | Circuito del subcontratista: OC, certificados, adicionales, confirmación |
+| `subcontratos.mjs` (91) | Circuito del subcontratista: OC, certificados, adicionales, confirmación |
 | `subcontratos-actualizacion.mjs` (41) | Actualizaciones de precio del contrato del subcontratista |
 | `replanteo.mjs` (64) | Plan por versiones: disponible, curva, edición, borrado, migración de replanteos viejos |
 | `informe-avance.mjs` (51) | Informe de avance y trabajos fuera del pliego |
@@ -220,9 +220,12 @@ calcados de la planilla de Excel de Carlos Loza.
     OC a precios originales. La planilla manda la historia de precios de cada ítem (`precios`) para
     que la pantalla recalcule si se cambia la fecha "hasta".
   - Cálculo en `utils/subcontratos.js` → `precioEn`, `conPreciosA`, `historiaDePrecios`.
-- Solo se corrige o anula el **último** certificado (cambiar uno del medio alteraría el "anterior"
-  de los siguientes, que ya se pagaron). Al corregir/anular, los ítems nuevos que ese certificado
-  creó lo acompañan.
+- **Se corrige cualquier certificado** (desde el 07/10/2026; antes solo el último). El "anterior"
+  de los siguientes se calcula, no se copia: corregir uno del medio mueve el anterior y el acumulado
+  de los que siguen, pero no lo certificado en ellos. El período no puede pisarse con el anterior ni
+  con el siguiente, y queda registrado quién lo corrigió (`editado_por_id`). **Anular, solo el
+  último.** Al corregir/anular, los ítems nuevos que ese certificado creó lo acompañan (uno que
+  otro certificado posterior también certifica no se puede llevar a cero).
 - **Descuentos**: líneas libres (adelanto de dinero, herramientas, otro) con el importe convenido.
 - Estadísticas: `original` / `de_mas` / `nuevo` / `contrato` (acordado a la fecha) / `pendiente` /
   `avance` / `certificado` / `descuentos` / `neto_pagado`.

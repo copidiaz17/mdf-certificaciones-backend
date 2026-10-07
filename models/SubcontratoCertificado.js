@@ -20,6 +20,10 @@ export const SubcontratoCertificado = sequelize.define(
     anulado: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     observaciones: { type: DataTypes.TEXT, allowNull: true },
     creado_por_id: { type: DataTypes.INTEGER, allowNull: true },
+    // Quién lo corrigió por última vez. Desde que se puede corregir cualquier
+    // certificado (no solo el último), tiene que quedar a la vista quién tocó
+    // uno ya emitido.
+    editado_por_id: { type: DataTypes.INTEGER, allowNull: true },
   },
   { tableName: "subcontrato_certificados", freezeTableName: true, timestamps: true }
 );
