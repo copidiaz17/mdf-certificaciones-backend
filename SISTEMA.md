@@ -48,7 +48,8 @@ Hoy los **backends son idénticos archivo por archivo** salvo: `.gitignore`, `pa
 (MDF tiene `start` y devDependencies), `CrearUsuario.js` (solo Falube), `.env.example` (solo MDF).
 En los **frontends** las únicas diferencias legítimas son la marca:
 `DashboardView.vue`, `LoginView.vue`, `assets/css/Dashboard.css`, `assets/css/Loguin.css`,
-y el logo (`logo-mdf.jpg`).
+el logo (`logo-mdf.jpg`) y `src/config/empresa.js` (nombre, logo y color de los PDF, como el
+certificado del subcontratista).
 
 ### ⚠️ Render NO despliega solo
 
