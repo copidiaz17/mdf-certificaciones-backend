@@ -216,6 +216,13 @@ try {
   r = await req("POST", `/obras/${obraId}/replanteos`, { ...base, meses: mesesV1() });
   check("el replanteo (3 meses siguientes) se guarda", r.status === 201 && r.data?.version === 1, `→ ${r.status} ${r.data?.message}`);
 
+  // El replanteo parte de lo ejecutado hasta su corte: sin ese avance, su base
+  // cambiaría sin que nadie lo vea.
+  const corte = (await sql(`SELECT avance_corte_id c FROM planificaciones WHERE obra_id = ${obraId} AND version = 1 AND avance_corte_id IS NOT NULL LIMIT 1`))[0]?.c;
+  r = corte ? await req("DELETE", `/obras/${obraId}/avances/${corte}`) : { status: 0 };
+  check("el avance donde corta el replanteo no se puede borrar", r.status === 400 && /replanteo/.test(r.data?.message || ""),
+    `→ ${corte} ${r.status} ${r.data?.message}`);
+
   // ───────────────────────────────────────────────────────────────────
   console.log("\n=== La curva del replanteo ===");
   c = await curva();

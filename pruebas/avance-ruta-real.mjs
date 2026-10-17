@@ -120,12 +120,36 @@ try {
   check("responde", r.status === 200, `→ ${r.status}`);
   check("el item aparece (no se certifico nada todavia)", (r.data || []).some((i) => i.id === itemExcav));
 
+  // ── Borrar un avance ───────────────────────────────────────────────────
+  // No existía: un avance cargado mal solo se podía corregir.
+  console.log("\n=== Borrar un avance ===");
+  r = await req("POST", `/obras/${obraId}/avances`, {
+    numero_avance: 9, fecha_avance: "2026-05-15", periodo_desde: "2026-05-11", periodo_hasta: "2026-05-15",
+    items: [{ pliego_item_id: itemExcav, cantidad_ejecutada: 5 }],
+  });
+  const aBorrar = r.data?.id;
+  if (aBorrar) avanceIds.push(aBorrar);
+  // Un informe ya emitido que lo incluye (directo en la base: el usuario de
+  // esta suite no existe, y el informe guarda quién lo emitió).
+  await sql(`INSERT INTO informes_avance (obra_id, fecha_desde, fecha_hasta, fecha_informe, datos, createdAt, updatedAt)
+             VALUES (${obraId}, '2026-05-11', '2026-05-15', '2026-05-16', '${JSON.stringify({ items: [], totales: {}, avances_incluidos: [{ id: aBorrar }] })}', NOW(), NOW())`);
+  r = await req("DELETE", `/obras/${obraId}/avances/999999999`);
+  check("uno que no existe da 404", r.status === 404, `→ ${r.status}`);
+  r = await req("DELETE", `/obras/${obraId}/avances/${aBorrar}`);
+  check("se borra", r.status === 200, `→ ${r.status} ${r.data?.message}`);
+  check("y avisa que un informe ya emitido lo incluía", r.data?.informes_que_lo_incluian?.length === 1 && /1 informe/.test(r.data?.message || ""),
+    `→ ${r.data?.message}`);
+  check("con sus ítems", Number((await sql(`SELECT COUNT(*) n FROM avance_obra_items WHERE avance_obra_id = ${aBorrar}`))[0].n) === 0);
+  r = await req("DELETE", `/obras/${obraId}/avances/${aBorrar}`);
+  check("borrado, ya no está", r.status === 404, `→ ${r.status}`);
+
 } catch (e) {
   console.error("EXPLOTO:", e.message, e.stack?.split("\n")[1]); fail++;
 } finally {
   console.log("\nLimpiando...");
   for (const id of avanceIds) await sql(`DELETE FROM avance_obra_items WHERE avance_obra_id = ${id}`);
   if (obraId) {
+    await sql(`DELETE FROM informes_avance WHERE obra_id = ${obraId}`);
     await sql(`DELETE FROM certificacion_items WHERE certificacion_id IN (SELECT id FROM certificaciones WHERE obra_id = ${obraId})`);
     await sql(`DELETE FROM certificaciones WHERE obra_id = ${obraId}`);
     await sql(`DELETE FROM avance_obras WHERE obra_id = ${obraId}`);

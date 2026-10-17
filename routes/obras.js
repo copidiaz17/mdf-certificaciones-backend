@@ -7,6 +7,7 @@ import PliegoItem from "../models/PliegoItem.js";
 
 import Planificacion from "../models/planificacion.js";
 import PlanificacionItem from "../models/planificacionItem.js";
+import InformeAvance from "../models/InformeAvance.js";
 
 import Certificacion from "../models/Certificacion.js";
 import CertificacionItem from "../models/CertificacionItem.js";
@@ -1374,6 +1375,54 @@ router.put("/:obraId/avances/:avanceId", authMiddleware, hasRole([ROLES.ADMIN, R
     await t.rollback();
     console.error("Error editando avance:", error);
     return res.status(500).json({ message: "Error al editar avance" });
+  }
+});
+
+/* ======================================================
+   🗑️ BORRAR AVANCE DE OBRA
+   · No se borra el avance donde corta un replanteo: el replanteo parte de lo
+     ejecutado hasta ahí, y sin ese avance su base cambia sin que nadie lo vea.
+   · Los informes ya emitidos que lo incluían no cambian (guardan sus números
+     tal como se entregaron): se avisa cuáles son, para rehacerlos si hace falta.
+====================================================== */
+router.delete("/:obraId/avances/:avanceId", authMiddleware, hasRole([ROLES.ADMIN, ROLES.OPERATOR]), async (req, res) => {
+  const t = await sequelize.transaction();
+  try {
+    const { obraId, avanceId } = req.params;
+    const avance = await AvanceObra.findOne({ where: { id: avanceId, obra_id: obraId }, transaction: t });
+    if (!avance) { await t.rollback(); return res.status(404).json({ message: "Avance no encontrado" }); }
+
+    const replanteo = await Planificacion.findOne({
+      where: { obraId, avance_corte_id: avance.id }, attributes: ["version"], raw: true, transaction: t,
+    });
+    if (replanteo) {
+      await t.rollback();
+      return res.status(400).json({
+        message: `El avance N° ${avance.numero_avance} es el corte del replanteo ${replanteo.version}: el replanteo parte de lo `
+          + "ejecutado hasta acá. Para borrarlo, primero hay que borrar ese replanteo.",
+      });
+    }
+
+    const informes = (await InformeAvance.findAll({
+      where: { obra_id: obraId }, attributes: ["id", "fecha_desde", "fecha_hasta", "datos"], raw: true, transaction: t,
+    })).filter((i) => {
+      try { return (JSON.parse(i.datos).avances_incluidos || []).some((a) => Number(a.id) === avance.id); } catch { return false; }
+    });
+
+    await AvanceObraItem.destroy({ where: { avance_obra_id: avance.id }, transaction: t });
+    await avance.destroy({ transaction: t });
+    await t.commit();
+
+    return res.json({
+      ok: true,
+      message: `Avance N° ${avance.numero_avance} borrado`
+        + (informes.length ? `. ${informes.length} informe(s) ya emitido(s) lo incluían y quedan como se emitieron.` : ""),
+      informes_que_lo_incluian: informes.map((i) => ({ id: i.id, fecha_desde: i.fecha_desde, fecha_hasta: i.fecha_hasta })),
+    });
+  } catch (error) {
+    await t.rollback();
+    console.error("Error borrando avance:", error);
+    return res.status(500).json({ message: "Error al borrar el avance" });
   }
 });
 
