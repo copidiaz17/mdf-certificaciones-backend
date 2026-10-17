@@ -40,7 +40,9 @@ router.post("/login", loginLimiter, async (req, res) => {
         rol: user.rol,
       },
       SECRET,
-      { expiresIn: "1h" }
+      // 8 horas, una jornada, igual que el sistema de costos. Con 1 hora el
+      // sistema sacaba a los jefes de obra en medio de una carga.
+      { expiresIn: "8h" }
     );
 
     return res.json({ token });
