@@ -130,7 +130,9 @@ export const claseDe = (it) =>
 
 export const ETIQUETAS = {
   contrato: "Contrato",
-  de_mas: "Adicional · cargado de más",
+  // "Mayor cantidad" y no "cargado de más": eso sonaba a un error del técnico
+  // que cargó, y es trabajo que se hizo por encima de lo contratado.
+  de_mas: "Adicional · mayor cantidad",
   nuevo: "Adicional · ítem nuevo",
 };
 
@@ -149,7 +151,7 @@ export function sumarCertificados(certs, certItemsPorCert) {
 }
 
 /**
- * Desdobla un ítem en lo contratado y lo cargado de más.
+ * Desdobla un ítem en lo contratado y la mayor cantidad (lo que lo pasa).
  *
  * `ant` y `act` son las cantidades e importes TOTALES (anterior y actual). Lo
  * que supera lo contratado se corta y pasa a ser el renglón de adicional.
@@ -297,7 +299,7 @@ export function planillaDe({ items, certificados, certItemsPorCert, descuentos, 
 
 /**
  * Estadísticas del subcontrato: acordado, avanzado, pendiente, y los
- * adicionales separados en "cargado de más" e "ítem nuevo".
+ * adicionales separados en "mayor cantidad" e "ítem nuevo".
  */
 export function resumenSubcontrato({ items, certificados, certItemsPorCert, descuentos }) {
   const { cantidad, importe } = sumarCertificados(certificados, certItemsPorCert);

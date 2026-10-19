@@ -194,7 +194,7 @@ try {
   check("sin confirmar, el servidor frena y pregunta (409)", r.status === 409 && r.data?.requiere_confirmacion === true, `→ ${r.status}`);
   const exDeMas = r.data?.extras?.find((x) => x.tipo === "de_mas");
   const exNuevo = r.data?.extras?.find((x) => x.tipo === "nuevo");
-  check("avisa que la demolición se carga 10 m2 de más", exDeMas?.subcontrato_item_id === s.S1 && cerca(exDeMas?.cantidad, 10) && /de más/.test(exDeMas?.mensaje || ""),
+  check("avisa que la demolición se carga 10 m2 de más", exDeMas?.subcontrato_item_id === s.S1 && cerca(exDeMas?.cantidad, 10) && /más de lo contratado/.test(exDeMas?.mensaje || ""),
     `→ ${JSON.stringify(exDeMas)}`);
   check("y que la limpieza es un ítem nuevo", exNuevo?.descripcion === "Limpieza final de obra" && /ítem nuevo/.test(exNuevo?.mensaje || ""), `→ ${JSON.stringify(exNuevo)}`);
   console.log(`     "${r.data?.message}"`);
@@ -214,8 +214,8 @@ try {
   const rS1 = det.resumen.items.find((i) => i.id === s.S1);
   check("la demolición queda al 100%, sin pasarse", cerca(rS1.certificado, 332) && cerca(rS1.avance, 100), `→ ${rS1.certificado} / ${rS1.avance}`);
   const vS1 = det.resumen.items.find((i) => i.id === `de-mas-${s.S1}`);
-  check("los 10 m2 de más son su propio renglón: adicional · cargado de más",
-    vS1?.virtual === true && vS1?.clase === "de_mas" && /de más/.test(vS1?.etiqueta) && cerca(vS1?.certificado, 10) && cerca(vS1?.total, 44000),
+  check("los 10 m2 de más son su propio renglón: adicional · mayor cantidad",
+    vS1?.virtual === true && vS1?.clase === "de_mas" && /mayor cantidad/.test(vS1?.etiqueta) && cerca(vS1?.certificado, 10) && cerca(vS1?.total, 44000),
     `→ ${JSON.stringify(vS1)}`);
   check("y dice qué rubro agranda", vS1?.rubro_origen === "DEMOLICION DE CUBIERTA METALICA");
   const rNuevo = det.resumen.items.find((i) => i.id === nuevoItem?.id);
@@ -269,7 +269,7 @@ try {
   check("ni el rubro que agranda un adicional", r.status === 400, `→ ${r.status}`);
 
   // ─────────────────────────────────────────────────────────────────
-  console.log("\n=== Se corrige cualquier certificado; se anula solo el ÚLTIMO ===");
+  console.log("\n=== Se corrige cualquier certificado; se elimina solo el ÚLTIMO ===");
   // Un jefe de obra cargó mal varios certificados de Loza y solo se podía
   // corregir el último. El "anterior" se calcula, no se copia: corregir uno del
   // medio mueve el anterior de los siguientes, pero no lo certificado en ellos.
@@ -292,15 +292,15 @@ try {
   pl = (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`)).data;
   check("vale 10 m2 más de tabique al precio congelado: $4.343.150", cerca(pl.totales.importe.actual, 4343150), `→ ${pl.totales.importe.actual}`);
   check("y queda registrado que se corrigió", !!pl.corregido, `→ ${JSON.stringify(pl.corregido)}`);
-  check("no es el último: no ofrece anularlo", pl.es_ultimo === false);
+  check("no es el último: no ofrece eliminarlo", pl.es_ultimo === false);
   const pl3 = (await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`)).data;
   check("el ANTERIOR del tabique en el N° 3 se acomoda solo: 240 + 200", cerca(pl3.filas.find((f) => f.id === s.S3).anterior.cantidad, 440),
     `→ ${pl3.filas.find((f) => f.id === s.S3).anterior.cantidad}`);
   check("pero lo certificado en el N° 3 no cambia", cerca(pl3.totales.importe.actual, pl3Antes.totales.importe.actual), `→ ${pl3.totales.importe.actual}`);
   r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`, cuerpoC2(190));
   check("y se vuelve a como estaba", r.status === 200, `→ ${r.status} ${r.data?.message}`);
-  r = await req("POST", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}/anular`);
-  check("anular uno del medio se sigue rechazando", r.status === 400, `→ ${r.status}`);
+  r = await req("DELETE", `/obras/${obraId}/subcontratos/${subId}/certificados/${c2}`);
+  check("eliminar uno del medio se rechaza: dejaría un hueco en la numeración", r.status === 400, `→ ${r.status}`);
 
   const corr = (items, extra = {}) => ({ desde: "2026-03-09", hasta: "2026-03-20", items, ...extra });
   r = await req("PUT", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`,
@@ -326,15 +326,18 @@ try {
   const escombros = det.items.find((i) => i.descripcion === "Retiro de escombros");
   check("y queda como nacido en el certificado 3", escombros?.creado_en_certificado_id === c3 && escombros?.tipo_adicional === "nuevo");
 
-  r = await req("POST", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}/anular`);
-  check("el último se anula", r.status === 200 && r.data.items_quitados === 1, `→ ${r.status} ${JSON.stringify(r.data)}`);
+  r = await req("DELETE", `/obras/${obraId}/subcontratos/${subId}/certificados/${c3}`);
+  check("el último se elimina", r.status === 200 && r.data.items_quitados === 1 && r.data.numero_libre === 3, `→ ${r.status} ${JSON.stringify(r.data)}`);
+  check("y no queda guardado", Number((await sql(`SELECT COUNT(*) n FROM subcontrato_certificados WHERE id = ${c3}`))[0].n) === 0);
   det = (await req("GET", `/obras/${obraId}/subcontratos/${subId}`)).data;
   check("y se lleva el ítem nuevo que había creado", !det.items.some((i) => i.descripcion === "Retiro de escombros"));
   check("el adicional cargado a mano se queda", det.items.some((i) => i.descripcion === exc.descripcion));
   r = await req("GET", `/obras/${obraId}/subcontratos/${subId}/certificados/nuevo`);
-  check("el siguiente es el N° 4 y retoma después del N° 2", r.data.certificado.numero === 4 && r.data.certificado.desde === "2026-03-07",
+  // Antes la anulación lo dejaba guardado y el siguiente era el N° 4: la
+  // numeración quedaba con un hueco.
+  check("su número queda libre: el siguiente es el N° 3 y retoma después del N° 2", r.data.certificado.numero === 3 && r.data.certificado.desde === "2026-03-07",
     `→ ${JSON.stringify(r.data.certificado)}`);
-  check("el anulado deja de contar", det.resumen.totales.certificados === 2 && cerca(det.resumen.items.find((i) => i.id === s.S3).certificado, 430));
+  check("el eliminado deja de contar", det.resumen.totales.certificados === 2 && cerca(det.resumen.items.find((i) => i.id === s.S3).certificado, 430));
 
   // ─────────────────────────────────────────────────────────────────
   console.log("\n=== Aparte de la obra ===");

@@ -203,7 +203,8 @@ calcados de la planilla de Excel de Carlos Loza.
 - **Los extras no se cargan antes.** Al certificar, si un rubro pasa lo contratado o aparece uno
   que no existía, el servidor responde **409 `requiere_confirmacion`** con el detalle de cada cosa
   y su clase; recién con `confirmar_extras: true` lo registra como adicional.
-  - `de_mas` → más cantidad de un rubro que ya estaba (dice cuál agranda).
+  - `de_mas` → más cantidad de un rubro que ya estaba (dice cuál amplía). En pantalla y en el PDF
+    se llama **"mayor cantidad"**: "cargado de más" sonaba a error del técnico (19/10/2026).
   - `nuevo` → un rubro que no existía (se crea con `creado_en_certificado_id`).
 - Lo certificado por encima de lo contratado sale como **renglón propio**: el rubro original nunca
   pasa del 100 %.
@@ -224,8 +225,9 @@ calcados de la planilla de Excel de Carlos Loza.
 - **Se corrige cualquier certificado** (desde el 07/10/2026; antes solo el último). El "anterior"
   de los siguientes se calcula, no se copia: corregir uno del medio mueve el anterior y el acumulado
   de los que siguen, pero no lo certificado en ellos. El período no puede pisarse con el anterior ni
-  con el siguiente, y queda registrado quién lo corrigió (`editado_por_id`). **Anular, solo el
-  último.** Al corregir/anular, los ítems nuevos que ese certificado creó lo acompañan (uno que
+  con el siguiente, y queda registrado quién lo corrigió (`editado_por_id`). **Eliminar, solo el
+  último**, y se borra de verdad: su número queda libre para el próximo (antes se anulaba y la
+  numeración quedaba con un hueco, como el N° 14 de Loza). Al corregir/eliminar, los ítems nuevos que ese certificado creó lo acompañan (uno que
   otro certificado posterior también certifica no se puede llevar a cero).
 - **Descuentos**: líneas libres (adelanto de dinero, herramientas, otro) con el importe convenido.
 - Estadísticas: `original` / `de_mas` / `nuevo` / `contrato` (acordado a la fecha) / `pendiente` /
@@ -256,7 +258,7 @@ Roles normalizados en `middlewares/authorization.js`: `admin`/`administrador`,
 | `certificaciones.js` | `GET|POST /obras/:obraId/certificaciones`, `/acumulado`, `/:id/detalle`, `PUT /:certId`, `POST /:certId/anular`, `/reactivar` |
 | `avanceObra.js` | `POST /:obraId/items`, `/previsualizar`, `GET /:obraId/excedentes`, `POST /:obraId/excedentes/:id/convertir` |
 | `replanteos.js` | `GET /:obraId/replanteos/contexto`, `POST /:obraId/replanteos`, `PUT|DELETE /:obraId/replanteos/:version` |
-| `subcontratos.js` | `/:obraId/subcontratos*`, `/subcontratos-pliego`, `/:subId/certificados/{nuevo,:certId}`, `POST|PUT` certificados, `/anular`, `POST /:subId/actualizaciones`, `PUT|DELETE /:subId/actualizaciones/:actId` |
+| `subcontratos.js` | `/:obraId/subcontratos*`, `/subcontratos-pliego`, `/:subId/certificados/{nuevo,:certId}`, `POST|PUT|DELETE` certificados (`/anular` quedó y también elimina), `POST /:subId/actualizaciones`, `PUT|DELETE /:subId/actualizaciones/:actId` |
 | `informesAvance.js` | `/:obraId/informes-avance*` + fotos |
 | `publica.js` | `/publica/obras`, `/publica/obras/:id/avance`, `/publica/obras/:id/certificados` |
 | `catalogo.js`, `usuarios.js` | catálogo de ítems generales, alta de usuarios |

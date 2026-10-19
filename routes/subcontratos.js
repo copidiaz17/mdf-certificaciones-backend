@@ -12,7 +12,7 @@
 //   GET    /obras/:obraId/subcontratos/:subId/certificados/:certId     planilla de un certificado
 //   POST   /obras/:obraId/subcontratos/:subId/certificados             certifica un período
 //   PUT    /obras/:obraId/subcontratos/:subId/certificados/:certId     corrige cualquiera
-//   POST   /obras/:obraId/subcontratos/:subId/certificados/:certId/anular  anula el ÚLTIMO
+//   DELETE /obras/:obraId/subcontratos/:subId/certificados/:certId     elimina el ÚLTIMO (su número queda libre)
 //   POST   /obras/:obraId/subcontratos/:subId/actualizaciones          actualización de precios
 //   PUT    /obras/:obraId/subcontratos/:subId/actualizaciones/:actId   la corrige (si no se usó)
 //   DELETE /obras/:obraId/subcontratos/:subId/actualizaciones/:actId   la borra (si no se usó)
@@ -208,12 +208,12 @@ async function validarOC({ obraId, body, existentes = new Set(), t }) {
     if (esAdicional) {
       tipo = it.tipo_adicional;
       if (!TIPOS_ADICIONAL.includes(tipo)) {
-        return { error: `El adicional "${descripcion}" tiene que decir si es un rubro cargado de más o un ítem nuevo.` };
+        return { error: `El adicional "${descripcion}" tiene que decir si es por mayor cantidad de un rubro o un ítem nuevo.` };
       }
       if (tipo === "de_mas") {
         itemOrigen = it.item_origen_id ? Number(it.item_origen_id) : null;
         if (!itemOrigen || !existentes.has(itemOrigen)) {
-          return { error: `El adicional "${descripcion}" es de más: indicá qué rubro de la OC agranda.` };
+          return { error: `El adicional "${descripcion}" es por mayor cantidad: indicá qué rubro de la OC amplía.` };
         }
       }
     }
@@ -519,7 +519,8 @@ router.get("/:obraId/subcontratos/:subId/certificados/nuevo", authMiddleware, LE
       inicio: d.sub.fecha_inicio || d.sub.fecha_contrato,
       periodicidad: d.sub.periodicidad,
     });
-    const numero = d.todos.reduce((m, c) => Math.max(m, c.numero), 0) + 1;
+    // El siguiente al último vigente: el número de uno eliminado queda libre.
+    const numero = d.vigentes.reduce((m, c) => Math.max(m, c.numero), 0) + 1;
     return res.json(armarPlanilla(d, { id: null, numero, desde: periodo.desde, hasta: periodo.hasta, fecha: hoyISO() }));
   } catch (error) {
     console.error("Error certificado nuevo:", error);
@@ -613,7 +614,7 @@ function validarCertificado({ body, d, anteriorHasta, siguiente = null }) {
 
 /**
  * Lo que este certificado registraría como ADICIONAL: rubros que superan lo
- * contratado ("cargado de más") y rubros que no existían ("ítem nuevo").
+ * contratado ("mayor cantidad") y rubros que no existían ("ítem nuevo").
  * Los ítems que nacieron en este mismo certificado no cuentan: su cantidad
  * acordada es justamente la que se certifica.
  */
@@ -638,7 +639,7 @@ function extrasDe(d, datos, cert) {
         descripcion: it.descripcion,
         unidad: it.unidad,
         cantidad: r4(exced),
-        mensaje: `"${it.descripcion}": se está cargando ${r4(exced)} ${it.unidad || ""} de más sobre lo contratado (${r4(it.cantidad)}). Se registra como adicional: cargado de más.`,
+        mensaje: `"${it.descripcion}": se certifican ${r4(exced)} ${it.unidad || ""} más de lo contratado (${r4(it.cantidad)}). Se registra como adicional por mayor cantidad.`,
       });
     }
   }
@@ -708,7 +709,8 @@ router.post("/:obraId/subcontratos/:subId/certificados", authMiddleware, ESCRIBI
     const extras = extrasDe(d, datos, null);
     if (extras.length && req.body.confirmar_extras !== true) { await t.rollback(); return pedirConfirmacion(res, extras); }
 
-    const numero = d.todos.reduce((m, c) => Math.max(m, c.numero), 0) + 1;
+    // El siguiente al último vigente: el número de uno eliminado queda libre.
+    const numero = d.vigentes.reduce((m, c) => Math.max(m, c.numero), 0) + 1;
     const cert = await SubcontratoCertificado.create({
       subcontrato_id: d.sub.id, numero, desde: datos.desde, hasta: datos.hasta,
       fecha: datos.fecha || hoyISO(), observaciones: datos.observaciones, creado_por_id: req.user?.id || null,
@@ -827,35 +829,59 @@ router.put("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, 
   }
 });
 
-router.post("/:obraId/subcontratos/:subId/certificados/:certId/anular", authMiddleware, ESCRIBIR, async (req, res) => {
+/* ======================================================
+   ELIMINAR el ÚLTIMO certificado
+   Antes se anulaba: quedaba guardado y el próximo tomaba el número siguiente,
+   así que la numeración quedaba con un hueco (en Loza, Paul Groussac, el
+   N° 14). Ahora se borra con sus cantidades, sus descuentos y los ítems nuevos
+   que creó, y su número queda libre para el próximo (lo pidió José).
+   Solo el último: borrar uno del medio dejaría el hueco igual y cambiaría el
+   "anterior" de los siguientes. Si uno del medio está mal, se corrige.
+====================================================== */
+async function eliminarUltimo(req, res) {
   const t = await sequelize.transaction();
   try {
     const { obraId, subId, certId } = req.params;
     const d = await cargar(obraId, subId, t);
     if (!d) { await t.rollback(); return res.status(404).json({ message: "Subcontrato no encontrado" }); }
     const cert = d.vigentes.find((c) => c.id === Number(certId));
-    if (!cert) { await t.rollback(); return res.status(404).json({ message: "Certificado no encontrado o ya anulado" }); }
+    if (!cert) { await t.rollback(); return res.status(404).json({ message: "Certificado no encontrado" }); }
     if (cert.id !== d.vigentes[d.vigentes.length - 1].id) {
       await t.rollback();
-      return res.status(400).json({ message: "Solo se puede anular el último certificado." });
+      return res.status(400).json({
+        message: "Solo se puede eliminar el último certificado: borrar uno del medio dejaría un hueco en la numeración. Si está mal, corregilo.",
+      });
     }
 
     // Los ítems nuevos que nacieron en este certificado se van con él: no
     // tienen nada certificado en otro lado.
     const nacidos = d.items.filter((i) => i.creado_en_certificado_id === cert.id).map((i) => i.id);
     if (nacidos.length) {
-      await SubcontratoCertificadoItem.destroy({ where: { certificado_id: cert.id, subcontrato_item_id: nacidos }, transaction: t });
+      await SubcontratoActualizacionItem.destroy({ where: { subcontrato_item_id: nacidos }, transaction: t });
+      await SubcontratoCertificadoItem.destroy({ where: { subcontrato_item_id: nacidos }, transaction: t });
       await SubcontratoItem.destroy({ where: { id: nacidos }, transaction: t });
     }
-    await SubcontratoCertificado.update({ anulado: true }, { where: { id: cert.id }, transaction: t });
+    await SubcontratoDescuento.destroy({ where: { certificado_id: cert.id }, transaction: t });
+    await SubcontratoCertificadoItem.destroy({ where: { certificado_id: cert.id }, transaction: t });
+    await SubcontratoCertificado.destroy({ where: { id: cert.id }, transaction: t });
     await t.commit();
-    return res.json({ ok: true, message: `Certificado N° ${cert.numero} anulado`, items_quitados: nacidos.length });
+    return res.json({
+      ok: true,
+      message: `Certificado N° ${cert.numero} eliminado: el próximo vuelve a ser el N° ${cert.numero}.`,
+      numero_libre: cert.numero,
+      items_quitados: nacidos.length,
+    });
   } catch (error) {
     await t.rollback();
-    console.error("Error anulando certificado de subcontrato:", error);
-    return res.status(500).json({ message: "Error al anular el certificado" });
+    console.error("Error eliminando certificado de subcontrato:", error);
+    return res.status(500).json({ message: "Error al eliminar el certificado" });
   }
-});
+}
+
+router.delete("/:obraId/subcontratos/:subId/certificados/:certId", authMiddleware, ESCRIBIR, eliminarUltimo);
+// La ruta de antes, para la pantalla que todavía no se desplegó: ahora elimina
+// igual, así tampoco deja huecos en la numeración.
+router.post("/:obraId/subcontratos/:subId/certificados/:certId/anular", authMiddleware, ESCRIBIR, eliminarUltimo);
 
 /* ======================================================
    ACTUALIZACIONES DE PRECIO
