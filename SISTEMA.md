@@ -192,6 +192,15 @@ El importe de cada ítem sale **del pliego** (`cantidad × costoUnitario × %`),
 - En el gráfico: el replanteo vigente es la **banda más ancha, atrás de todo** (width 20,
   `rgba(251,146,60,0.42)`, `order: 12`); el plan original queda **atenuado** y punteado
   (`rgba(56,189,248,0.13)`, `order: 14`). En chart.js, **mayor `order` = se dibuja más atrás**.
+- **Se baja en Excel y en PDF** (front `utils/planDeTrabajos.js`, pedido de José, 28/10/2026):
+  la versión entera —plan original o replanteo— con cada ítem en una fila y cada mes en una
+  columna, como la grilla del replanteo (en un replanteo, también lo ejecutado al corte, lo que
+  falta y lo que queda), y abajo la incidencia de cada mes y el avance acumulado; y cada mes
+  suelto. Botones en el historial de Planificación ("PDF completo", "Excel completo", y en cada
+  mes "PDF" y "Excel") y en la pantalla del replanteo guardado. Las cuentas son las de
+  `ReplanteoView` (`armarPlan`); todos llevan el logo y el color de `config/empresa.js`
+  (`utils/logoEmpresa.js`, el mismo del certificado del contratista). Antes solo había un PDF
+  por mes, sin logo.
 
 ### Subcontratistas (rehecho el 20/09/2026)
 
