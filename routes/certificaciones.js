@@ -57,7 +57,10 @@ function calcularTotales(subtotal, reparticion) {
     t.beneficios = beneficios;
     t.iva = iva;
     t.ingresos_brutos = ingresosBrutos;
-    t.total_neto = subtotal2 - iva - ingresosBrutos;
+    // El IVA y los ingresos brutos SUMAN: son parte del precio, como en el
+    // pliego (CargarPliegoView). Se restaban, y el certificado salía por
+    // debajo del subtotal 2; lo marcaron en Arquitectura de la Provincia (03/11/2026).
+    t.total_neto = subtotal2 + iva + ingresosBrutos;
   }
   // Si la obra no tiene repartición definida → total_neto = subtotal (sin deducciones)
 

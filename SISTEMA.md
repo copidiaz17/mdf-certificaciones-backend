@@ -175,7 +175,9 @@ para mostrarla, y los totales que manda el navegador se ignoran.
 
 - `municipalidad_sgo`: −40 % anticipo, −5 % fondo de reparo, −3 % tasa de inspección,
   y se re-suma la sustitución del fondo de reparo.
-- `direccion_arquitectura`: +15 % gastos generales, +10 % beneficios, luego −21 % IVA y −2,5 % IIBB.
+- `direccion_arquitectura`: +15 % gastos generales, +10 % beneficios, y sobre ese subtotal 2
+  **+21 % IVA y +2,5 % IIBB**: los impuestos suman, como en el pliego. Hasta el 03/11/2026 se
+  restaban, y el certificado salía por debajo del subtotal 2 (lo marcó Arquitectura de la Provincia).
 - Sin repartición: `total_neto = subtotal`.
 
 El importe de cada ítem sale **del pliego** (`cantidad × costoUnitario × %`), no de lo que mande la pantalla.

@@ -32,7 +32,7 @@ const req = async (m, ruta, body, tk) => {
 };
 
 const SUF = Date.now().toString().slice(-6);
-let obraId = null, itemId = null, certA = null, certB = null, token = null;
+let obraId = null, itemId = null, certA = null, certB = null, token = null, arqObraId = null;
 
 try {
   const base = sequelize.config.database;
@@ -170,6 +170,31 @@ try {
   r = await req("POST", `/certificaciones/${certA}/anular`, {});
   check("rechaza", r.status === 401 || r.status === 403, `→ ${r.status}`);
 
+  // ── 3. Arquitectura de la Provincia: los impuestos suman ──────────────
+  // Se restaban, y el certificado salía por debajo del subtotal 2. Como en
+  // el pliego: 50.000 + 15 % = 57.500; + 10 % = 63.250; + 21 % de IVA
+  // (13.282,50) + 2,5 % de IIBB (1.581,25) = 78.113,75.
+  console.log("\n=== Arquitectura: el IVA y los ingresos brutos suman ===");
+  await sql(`INSERT INTO obras (nombre, reparticion, createdAt, updatedAt)
+             VALUES ('Arquitectura ${SUF}', 'direccion_arquitectura', NOW(), NOW())`);
+  arqObraId = (await sql("SELECT LAST_INSERT_ID() id"))[0].id;
+  await sql(`INSERT INTO pliegoitems (obraId, ItemGeneralId, numeroItem, descripcionItem,
+                                      unidadMedida, cantidad, costoUnitario, costoParcial)
+             VALUES (${arqObraId}, ${itemGeneralId}, '1', 'Item de prueba', 'm3', 100, 1000, 100000)`);
+  const arqItemId = (await sql("SELECT LAST_INSERT_ID() id"))[0].id;
+  r = await req("POST", `/certificaciones/obras/${arqObraId}/certificaciones`, {
+    numero_certificado: 1, fecha_certificacion: "2026-03-31",
+    periodo_desde: "2026-03-01", periodo_hasta: "2026-03-31",
+    items: [{ pliego_item_id: arqItemId, avance_porcentaje: 50 }],
+  }, token);
+  check("crea el certificado", r.status === 201, `→ ${r.status} ${r.data?.error}`);
+  const arq = (await sql(`SELECT * FROM certificaciones WHERE id = ${Number(r.data?.certificacion_id)}`))[0] || {};
+  check("gastos generales del 15 %", Math.abs(Number(arq.gastos_generales) - 7500) < 0.01, `→ ${arq.gastos_generales}`);
+  check("beneficios del 10 %", Math.abs(Number(arq.beneficios) - 5750) < 0.01, `→ ${arq.beneficios}`);
+  check("IVA del 21 % sobre el subtotal 2", Math.abs(Number(arq.iva) - 13282.5) < 0.01, `→ ${arq.iva}`);
+  check("ingresos brutos del 2,5 %", Math.abs(Number(arq.ingresos_brutos) - 1581.25) < 0.01, `→ ${arq.ingresos_brutos}`);
+  check("el total los suma", Math.abs(Number(arq.total_neto) - 78113.75) < 0.01, `→ ${arq.total_neto}`);
+
 } catch (e) {
   console.error("EXPLOTO:", e.message, e.stack?.split("\n")[1]); fail++;
 } finally {
@@ -179,6 +204,12 @@ try {
                JOIN certificaciones c ON c.id = ci.certificacion_id WHERE c.obra_id = ${obraId}`);
     await sql(`DELETE FROM certificaciones WHERE obra_id = ${obraId}`);
     await sql(`DELETE FROM pliegoitems WHERE obraId = ${obraId}`);
+  }
+  if (arqObraId) {
+    await sql(`DELETE ci FROM certificacion_items ci
+               JOIN certificaciones c ON c.id = ci.certificacion_id WHERE c.obra_id = ${arqObraId}`);
+    await sql(`DELETE FROM certificaciones WHERE obra_id = ${arqObraId}`);
+    await sql(`DELETE FROM pliegoitems WHERE obraId = ${arqObraId}`);
   }
   await sql(`DELETE FROM obras WHERE nombre LIKE '%${SUF}'`);
   await sql(`DELETE FROM usuarios WHERE email LIKE '%${SUF}%'`);
